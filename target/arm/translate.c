@@ -5299,8 +5299,14 @@ static bool trans_MCR(DisasContext *s, arg_MCR *a)
     if (!valid_cp(s, a->cp)) {
         return false;
     }
-    do_coproc_insn(s, a->cp, false, a->opc1, a->crn, a->crm, a->opc2,
-                   false, a->rt, 0);
+
+    if (a->cp == 15 && a->opc1 == 0 && a->crn == 7 && a->crm == 10 && a->opc2 == 4) {
+        tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    } else {
+        do_coproc_insn(s, a->cp, false, a->opc1, a->crn, a->crm, a->opc2,
+                       false, a->rt, 0);
+    }
+
     return true;
 }
 

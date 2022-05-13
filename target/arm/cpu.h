@@ -239,6 +239,8 @@ typedef struct CPUArchState {
     /* Regs for current mode.  */
     uint32_t regs[16];
 
+    MemoryRegionSection *active_device;
+
     /* 32/64 switch only happens when taking and returning from
      * exceptions so the overlap semantics are taken care of then
      * instead of having a complicated union.

@@ -24,6 +24,7 @@
 #include "tcg/tcg-ldst.h"
 #include "qemu/compiler.h"
 #include <ffi.h>
+#include "qemu/plugin-memory.h"
 
 
 /*
@@ -457,6 +458,30 @@ static void tci_qemu_st(CPUArchState *env, target_ulong taddr, uint64_t val,
         case glue(glue(INDEX_op_, x), _i32):
 # define CASE_64(x)
 #endif
+
+static const char *dev_name(MemoryRegionSection *mrs)
+{
+    if (!mrs->mr->name) {
+        g_autofree char *temp = g_strdup_printf("dev%08lx", mrs->offset_within_address_space);
+        return g_intern_string(temp);
+    } else {
+        return g_intern_string(mrs->mr->name);
+    }
+}
+
+static void dev_check_access(CPUArchState *env, target_ulong taddr, MemOpIdx oi, bool is_read)
+{
+    struct qemu_plugin_hwaddr *hwaddr = qemu_plugin_get_hwaddr(make_plugin_meminfo(oi, is_read ? QEMU_PLUGIN_MEM_R : QEMU_PLUGIN_MEM_W), taddr);
+    if (hwaddr) {
+        if (hwaddr->is_io) {
+            MemoryRegionSection *dev = hwaddr->v.io.section;
+            if (env->active_device && env->active_device != dev) {
+                printf("WARNING: device barrier violation: accessed %s followed by %s without a barrier\n", dev_name(env->active_device), dev_name(dev));
+            }
+            env->active_device = dev;
+        }
+    }
+}
 
 /* Interpret pseudo code in tb. */
 /*
@@ -1040,6 +1065,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
                 taddr = tci_uint64(regs[r2], regs[r1]);
             }
             tmp32 = tci_qemu_ld(env, taddr, oi, tb_ptr);
+            dev_check_access(env, taddr, oi, true);
             regs[r0] = tmp32;
             break;
 
@@ -1056,6 +1082,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
                 oi = regs[r4];
             }
             tmp64 = tci_qemu_ld(env, taddr, oi, tb_ptr);
+            dev_check_access(env, taddr, oi, true);
             if (TCG_TARGET_REG_BITS == 32) {
                 tci_write_reg64(regs, r1, r0, tmp64);
             } else {
@@ -1073,6 +1100,7 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
             }
             tmp32 = regs[r0];
             tci_qemu_st(env, taddr, tmp32, oi, tb_ptr);
+            dev_check_access(env, taddr, oi, false);
             break;
 
         case INDEX_op_qemu_st_i64:
@@ -1092,11 +1120,13 @@ uintptr_t QEMU_DISABLE_CFI tcg_qemu_tb_exec(CPUArchState *env,
                 tmp64 = tci_uint64(regs[r1], regs[r0]);
             }
             tci_qemu_st(env, taddr, tmp64, oi, tb_ptr);
+            dev_check_access(env, taddr, oi, false);
             break;
 
         case INDEX_op_mb:
             /* Ensure ordering for all kinds */
             smp_mb();
+            env->active_device = NULL;
             break;
         default:
             g_assert_not_reached();
