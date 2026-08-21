@@ -26,6 +26,11 @@ linux_user_ss.add(libdw)
 
 linux_user_ss.add(when: 'TARGET_HAS_BFLT', if_true: files('flatload.c'))
 linux_user_ss.add(when: 'TARGET_I386', if_true: files('vm86.c'))
+
+# KVM-backed user-mode execution: x86-64 guest on an x86-64 host only.
+if host_arch == 'x86_64'
+  linux_user_ss.add(when: 'TARGET_X86_64', if_true: files('kvm/kvm-user.c'))
+endif
 linux_user_ss.add(when: 'CONFIG_ARM_COMPATIBLE_SEMIHOSTING', if_true: files('semihost.c'))
 
 if get_option('plugins')

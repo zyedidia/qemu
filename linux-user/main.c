@@ -58,6 +58,7 @@
 #include "user-mmap.h"
 #include "tcg/perf.h"
 #include "exec/page-vary.h"
+#include "kvm/kvm-user.h"
 
 #ifdef CONFIG_SEMIHOSTING
 #include "semihosting/semihost.h"
@@ -456,6 +457,13 @@ static void handle_arg_jitdump(const char *arg)
     perf_enable_jitdump();
 }
 
+#ifdef TARGET_X86_64
+static void handle_arg_kvm(const char *arg)
+{
+    kvm_user_enabled = true;
+}
+#endif
+
 static QemuPluginList plugins = QTAILQ_HEAD_INITIALIZER(plugins);
 
 #ifdef CONFIG_PLUGIN
@@ -534,6 +542,10 @@ static const struct qemu_argument arg_table[] = {
      "",           "Generate a /tmp/perf-${pid}.map file for perf"},
     {"jitdump",    "QEMU_JITDUMP",     false, handle_arg_jitdump,
      "",           "Generate a jit-${pid}.dump file for perf"},
+#ifdef TARGET_X86_64
+    {"kvm",        "QEMU_KVM",         false, handle_arg_kvm,
+     "",           "run the guest natively in a KVM VM (x86-64, experimental)"},
+#endif
     {NULL, NULL, false, NULL, NULL, NULL}
 };
 
@@ -735,6 +747,17 @@ int main(int argc, char **argv, char **envp)
     qemu_plugin_add_opts();
 
     optind = parse_args(argc, argv);
+
+#ifdef TARGET_X86_64
+    /* Also enable KVM mode when invoked as "qemu-kvm" (via a symlink). */
+    {
+        const char *base = strrchr(argv[0], '/');
+        base = base ? base + 1 : argv[0];
+        if (strcmp(base, "qemu-kvm") == 0) {
+            kvm_user_enabled = true;
+        }
+    }
+#endif
 
     qemu_set_log_filename_flags(last_log_filename,
                                 last_log_mask | (enable_strace * LOG_STRACE),
@@ -998,6 +1021,12 @@ int main(int argc, char **argv, char **envp)
     tcg_prologue_init();
 
     init_main_thread(cpu, info);
+
+#ifdef TARGET_X86_64
+    if (kvm_user_enabled) {
+        kvm_user_setup(cpu);
+    }
+#endif
 
     if (gdbstub) {
         gdbserver_start(gdbstub, &error_fatal);

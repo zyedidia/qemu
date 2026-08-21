@@ -24,6 +24,7 @@
 #include "user/cpu_loop.h"
 #include "signal-common.h"
 #include "user-mmap.h"
+#include "kvm/kvm-user.h"
 
 /***********************************************************/
 /* CPUX86 core interface */
@@ -214,7 +215,11 @@ void cpu_loop(CPUX86State *env)
 
     for(;;) {
         cpu_exec_start(cs);
-        trapnr = cpu_exec(cs);
+        if (kvm_user_enabled) {
+            trapnr = kvm_cpu_exec_user(cs);
+        } else {
+            trapnr = cpu_exec(cs);
+        }
         cpu_exec_end(cs);
         qemu_process_cpu_events(cs);
 
