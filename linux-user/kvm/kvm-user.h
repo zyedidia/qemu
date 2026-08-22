@@ -37,6 +37,14 @@ int kvm_cpu_exec_user(CPUState *cs);
  * and the VM has been created.
  */
 void kvm_user_track_range(uint64_t start, uint64_t len);
+
+/*
+ * Sync FP/SIMD state between the vCPU and env, called by the signal-frame code:
+ * get_fpu before saving env's FP into a signal frame, put_fpu after restoring
+ * env's FP from a frame on sigreturn.
+ */
+void kvm_user_get_fpu(CPUState *cs);
+void kvm_user_put_fpu(CPUState *cs);
 #endif /* TARGET_X86_64 */
 
 #endif /* LINUX_USER_KVM_USER_H */

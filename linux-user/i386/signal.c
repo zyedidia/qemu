@@ -22,6 +22,7 @@
 #include "signal-common.h"
 #include "linux-user/trace.h"
 #include "user/tswap-target.h"
+#include "kvm/kvm-user.h"
 
 /* from the Linux kernel - /arch/x86/include/uapi/asm/sigcontext.h */
 
@@ -368,6 +369,14 @@ static void setup_sigcontext(CPUX86State *env,
                              abi_ptr fpend_addr)
 {
     CPUState *cs = env_cpu(env);
+
+#ifdef TARGET_X86_64
+    /* Under KVM the live FP/SIMD state is in the vCPU; pull it into env so it
+     * gets saved into the signal frame correctly. */
+    if (kvm_user_enabled) {
+        kvm_user_get_fpu(cs);
+    }
+#endif
 
 #ifndef TARGET_X86_64
     uint16_t magic;
@@ -809,6 +818,14 @@ static bool restore_sigcontext(CPUX86State *env, struct target_sigcontext *sc)
 #endif
 
     unlock_user(fpstate, fpstate_addr, 0);
+
+#ifdef TARGET_X86_64
+    /* sigreturn restored env's FP/SIMD state from the frame; push it to the
+     * vCPU so the resumed context sees it. */
+    if (ok && kvm_user_enabled) {
+        kvm_user_put_fpu(env_cpu(env));
+    }
+#endif
     return ok;
 }
 

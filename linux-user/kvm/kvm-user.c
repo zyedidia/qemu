@@ -477,6 +477,29 @@ static void sync_to_vcpu(CPUState *cs, CPUX86State *env)
     }
 }
 
+/*
+ * FP/SIMD state normally lives in the vCPU; env's decomposed FP fields are
+ * stale.  The signal machinery reads/writes env's FP (to save into / restore
+ * from the signal frame), so sync it lazily exactly around those points.
+ * (M3: single scratch buffer; per-vCPU in M4.)
+ */
+static struct kvm_xsave kvm_xsave_scratch;
+
+void kvm_user_get_fpu(CPUState *cs)
+{
+    kvm_ioctl(cs->kvm_fd, KVM_GET_XSAVE, &kvm_xsave_scratch, "KVM_GET_XSAVE");
+    x86_cpu_xrstor_all_areas(X86_CPU(cs), &kvm_xsave_scratch,
+                             sizeof(kvm_xsave_scratch.region));
+}
+
+void kvm_user_put_fpu(CPUState *cs)
+{
+    memset(&kvm_xsave_scratch, 0, sizeof(kvm_xsave_scratch));
+    x86_cpu_xsave_all_areas(X86_CPU(cs), &kvm_xsave_scratch,
+                            sizeof(kvm_xsave_scratch.region));
+    kvm_ioctl(cs->kvm_fd, KVM_SET_XSAVE, &kvm_xsave_scratch, "KVM_SET_XSAVE");
+}
+
 static void sync_from_vcpu(CPUState *cs, CPUX86State *env)
 {
     struct kvm_regs *r = &cs->kvm_run->s.regs.regs;
@@ -583,6 +606,153 @@ void kvm_user_setup(CPUState *cs)
 }
 
 /* ------------------------------------------------------------------ */
+/* Fault address decoding                                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * When KVM returns a bare -EFAULT (GUP failure for a page inside a memslot,
+ * e.g. a PROT_NONE guard page or a munmap'd hole) it carries no fault address.
+ * Recover it by decoding the memory operand of the faulting instruction at RIP
+ * using the (already synced) guest register values.  Handles the common
+ * ModRM/SIB load/store encodings including REX and VEX prefixes, plus string
+ * ops; falls back to RIP for anything it can't decode.  guest_base == 0, so a
+ * guest VA is also the host VA of the same byte.
+ */
+static uint64_t decode_fault_addr(CPUX86State *env)
+{
+    uint64_t rip = env->eip;
+
+    if (!(page_get_flags(rip) & PAGE_READ)) {
+        return rip;                         /* instruction fetch fault */
+    }
+    const uint8_t *ip = (const uint8_t *)(uintptr_t)rip;
+
+    int i = 0, seg = -1;
+    int rex_x = 0, rex_b = 0;
+
+    /* Legacy prefixes. */
+    for (;;) {
+        uint8_t b = ip[i];
+        if (b == 0x66 || b == 0x67 || b == 0xf0 || b == 0xf2 || b == 0xf3 ||
+            b == 0x2e || b == 0x36 || b == 0x3e || b == 0x26) {
+            i++;
+            continue;
+        }
+        if (b == 0x64) { seg = R_FS; i++; continue; }
+        if (b == 0x65) { seg = R_GS; i++; continue; }
+        break;
+    }
+
+    /* REX / VEX, then step over the opcode so ip[i] lands on ModRM. */
+    uint8_t b = ip[i];
+    if (b == 0xc5) {                         /* 2-byte VEX */
+        i += 2 + 1;                          /* VEX + opcode */
+    } else if (b == 0xc4) {                  /* 3-byte VEX */
+        rex_x = !((ip[i + 1] >> 6) & 1);
+        rex_b = !((ip[i + 1] >> 5) & 1);
+        i += 3 + 1;
+    } else {
+        if ((b & 0xf0) == 0x40) {            /* REX */
+            rex_x = (b >> 1) & 1;
+            rex_b = b & 1;
+            i++;
+        }
+        uint8_t op = ip[i];
+        /* String ops have no ModRM: operand is RSI (load) and/or RDI (store). */
+        switch (op) {
+        case 0xa4: case 0xa5:                /* movs */
+        case 0xa6: case 0xa7:                /* cmps */
+            if (!(page_get_flags(env->regs[R_EDI]) & PAGE_VALID)) {
+                return env->regs[R_EDI];
+            }
+            return env->regs[R_ESI];
+        case 0xaa: case 0xab:                /* stos */
+        case 0xae: case 0xaf:                /* scas */
+            return env->regs[R_EDI];
+        case 0xac: case 0xad:                /* lods */
+            return env->regs[R_ESI];
+        }
+        if (op == 0x0f) {                    /* 2/3-byte opcode */
+            i++;
+            if (ip[i] == 0x38 || ip[i] == 0x3a) {
+                i++;
+            }
+        }
+        i++;                                 /* opcode byte */
+    }
+
+    uint8_t modrm = ip[i++];
+    int mod = modrm >> 6, rm = modrm & 7;
+
+    if (mod == 3) {
+        return rip;                          /* register operand: no memory */
+    }
+
+    uint64_t base = 0, index = 0;
+    int scale = 0, have_base = 1, have_index = 0;
+
+    if (rm == 4) {                           /* SIB */
+        uint8_t sib = ip[i++];
+        scale = sib >> 6;
+        int idx = ((sib >> 3) & 7) | (rex_x << 3);
+        int bas = (sib & 7) | (rex_b << 3);
+        if (((sib >> 3) & 7) != 4 || rex_x) {
+            have_index = 1;
+            index = env->regs[idx];
+        }
+        if ((sib & 7) == 5 && mod == 0) {
+            have_base = 0;                   /* disp32, no base */
+        } else {
+            base = env->regs[bas];
+        }
+    } else if (rm == 5 && mod == 0) {        /* RIP-relative */
+        int32_t disp;
+        memcpy(&disp, &ip[i], 4);
+        i += 4;
+        uint64_t addr = rip + i + disp;      /* best-effort (ignores immediate) */
+        if (seg >= 0) {
+            addr += env->segs[seg].base;
+        }
+        return addr;
+    } else {
+        base = env->regs[rm | (rex_b << 3)];
+    }
+
+    int64_t disp = 0;
+    if (mod == 1) {
+        disp = (int8_t)ip[i++];
+    } else if (mod == 2 || (mod == 0 && !have_base)) {
+        int32_t d;
+        memcpy(&d, &ip[i], 4);
+        disp = d;
+        i += 4;
+    }
+
+    uint64_t addr = (have_base ? base : 0) +
+                    (have_index ? (index << scale) : 0) + disp;
+    if (seg >= 0) {
+        addr += env->segs[seg].base;
+    }
+    return addr;
+}
+
+/* Build a #PF-style error_code for a fault at addr from the guest page flags. */
+static uint32_t fault_error_code(uint64_t addr, bool is_write)
+{
+    int flags = page_get_flags(addr);
+    uint32_t ec = 0;
+
+    if (flags & PAGE_VALID) {
+        ec |= PG_ERROR_P_MASK;               /* present -> SEGV_ACCERR */
+    }
+    /* A write to a present, non-writable page is a write-permission fault. */
+    if (is_write || ((flags & PAGE_VALID) && !(flags & PAGE_WRITE))) {
+        ec |= PG_ERROR_W_MASK;
+    }
+    return ec;
+}
+
+/* ------------------------------------------------------------------ */
 /* Run loop                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -611,6 +781,15 @@ static void read_ist_frame(uint64_t rsp_va, bool has_errcode,
     f->ss     = *(uint64_t *)(p + 32);
 }
 
+#define VSYSCALL_PAGE 0xffffffffff600000ULL
+
+static uint64_t read_cr2(CPUState *cs)
+{
+    struct kvm_sregs sregs;
+    kvm_ioctl(cs->kvm_fd, KVM_GET_SREGS, &sregs, "KVM_GET_SREGS");
+    return sregs.cr2;
+}
+
 static bool vector_has_errcode(int v)
 {
     switch (v) {
@@ -631,6 +810,17 @@ int kvm_cpu_exec_user(CPUState *cs)
     for (;;) {
         sync_to_vcpu(cs, env);
 
+        /*
+         * If a host signal already arrived (host_signal_handler set
+         * signal_pending + exit_request), or an exclusive-section kick is
+         * pending, handle it instead of entering the guest.  Closes the race
+         * where a signal lands between here and KVM_RUN.
+         */
+        if (qatomic_read(&cs->exit_request) ||
+            qatomic_read(&get_task_state(cs)->signal_pending)) {
+            return EXCP_INTERRUPT;
+        }
+
         DBG("KVM_RUN enter rip=0x%llx\n", (unsigned long long)env->eip);
         int r = ioctl(cs->kvm_fd, KVM_RUN, 0);
         int err = errno;
@@ -644,10 +834,11 @@ int kvm_cpu_exec_user(CPUState *cs)
                 return EXCP_INTERRUPT;
             }
             if (err == EFAULT) {
-                /* GUP failure: unmapped/protected guest memory.  M1: approximate
-                 * the fault address; M2 adds instruction decode for si_addr. */
-                env->cr[2] = env->eip;
-                env->error_code = 0;
+                /* GUP failure inside a memslot (PROT_NONE/hole/munmap'd): KVM
+                 * gives no address, so decode the faulting instruction. */
+                uint64_t addr = decode_fault_addr(env);
+                env->cr[2] = addr;
+                env->error_code = fault_error_code(addr, false);
                 return EXCP0E_PAGE;
             }
             fprintf(stderr, "qemu-kvm: KVM_RUN failed: %s\n", strerror(err));
@@ -699,10 +890,27 @@ int kvm_cpu_exec_user(CPUState *cs)
                 case 5:  return EXCP05_BOUND;
                 case 6:  return EXCP06_ILLOP;
                 case 13: return EXCP0D_GPF;
-                case 14:
-                    /* CR2 for #PF: needs sregs; M1 approximates with faulting VA. */
-                    env->cr[2] = f.rip;
+                case 14: {
+                    /*
+                     * Guest #PF.  With static all-present identity user PTs this
+                     * only fires for kernel-half VAs the guest can't map -- in
+                     * practice the legacy vsyscall page.  CR2 holds the address.
+                     */
+                    uint64_t cr2 = read_cr2(cs);
+                    if ((cr2 & ~0xfffULL) == VSYSCALL_PAGE) {
+                        env->eip = cr2;          /* emulate_vsyscall reads offset */
+                        return EXCP_VSYSCALL;
+                    }
+                    env->cr[2] = cr2;
                     return EXCP0E_PAGE;
+                }
+                case 16:                          /* #MF: x87 FP exception */
+                case 19:                          /* #XM: SIMD FP exception */
+                    force_sig_fault(TARGET_SIGFPE, TARGET_FPE_FLTINV, f.rip);
+                    return EXCP_INTERRUPT;
+                case 17:                          /* #AC: alignment check */
+                    force_sig(TARGET_SIGBUS);
+                    return EXCP_INTERRUPT;
                 default:
                     force_sig(TARGET_SIGILL);
                     return EXCP_INTERRUPT;
@@ -719,10 +927,11 @@ int kvm_cpu_exec_user(CPUState *cs)
             return EXCP_INTERRUPT;
 
         case KVM_EXIT_MMIO:
-            /* Access to a GPA with no memslot: an unmapped (never-reserved)
-             * guest address -> SIGSEGV.  M2 will decode si_addr precisely. */
+            /* Access to a GPA with no memslot (unmapped guest address).  The
+             * faulting GPA is exact; derive the error code from page flags. */
             env->cr[2] = run->mmio.phys_addr;
-            env->error_code = run->mmio.is_write ? 2 : 0;
+            env->error_code = fault_error_code(run->mmio.phys_addr,
+                                               run->mmio.is_write);
             return EXCP0E_PAGE;
 
         case KVM_EXIT_INTR:

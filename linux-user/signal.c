@@ -37,6 +37,7 @@
 #include "user/page-protection.h"
 #include "user/safe-syscall.h"
 #include "user/signal.h"
+#include "kvm/kvm-user.h"
 #include "tcg/tcg.h"
 
 /* target_siginfo_t must fit in gdbstub's siginfo save area. */
@@ -962,6 +963,18 @@ void die_from_signal(siginfo_t *info)
 static void host_sigsegv_handler(CPUState *cpu, siginfo_t *info,
                                  host_sigcontext *uc)
 {
+#ifdef TARGET_X86_64
+    /*
+     * In KVM mode guest faults arrive as VM exits, never as host signals, so a
+     * host SIGSEGV here is a bug in QEMU itself.  The TCG recovery paths below
+     * (handle_sigsegv_accerr_write, in_code_gen_buffer, cpu_loop_exit_sigsegv)
+     * are meaningless -- and the MMU_INST_FETCH branch would siglongjmp an
+     * unset jmp_env -- so just die cleanly with diagnostics.
+     */
+    if (kvm_user_enabled) {
+        die_from_signal(info);
+    }
+#endif
     uintptr_t host_addr = (uintptr_t)info->si_addr;
     /*
      * Convert forcefully to guest address space: addresses outside

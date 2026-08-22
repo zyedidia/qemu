@@ -31,6 +31,12 @@ endif
 
 i386_user_ss = ss.source_set()
 
+# KVM-backed user-mode (linux-user) needs the xsave marshalling helpers to move
+# FP/SIMD state between env and the vCPU for signal frames.
+if host_os == 'linux'
+  i386_user_ss.add(when: 'TARGET_X86_64', if_true: files('xsave_helper.c'))
+endif
+
 subdir('kvm')
 subdir('whpx')
 subdir('nvmm')
