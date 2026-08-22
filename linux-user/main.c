@@ -144,6 +144,11 @@ unsigned long guest_stack_size = TARGET_DEFAULT_STACK_SIZE;
 void fork_start(void)
 {
     start_exclusive();
+#ifdef TARGET_X86_64
+    if (kvm_user_enabled) {
+        kvm_user_fork_start();
+    }
+#endif
     clone_fork_start();
     mmap_fork_start();
     cpu_list_lock();
@@ -170,6 +175,11 @@ void fork_end(pid_t pid)
         }
         qemu_init_cpu_list();
         get_task_state(thread_cpu)->ts_tid = qemu_get_thread_id();
+#ifdef TARGET_X86_64
+        if (kvm_user_enabled) {
+            kvm_user_fork_child(thread_cpu);
+        }
+#endif
     } else {
         cpu_list_unlock();
     }

@@ -9113,10 +9113,119 @@ static int do_execv(CPUArchState *cpu_env, int dirfd,
     if (is_proc_myself(p, "exe")) {
         exe = real_exec_path;
     }
-    ret = is_execveat
-        ? safe_execveat(dirfd, exe, argp, envp, flags)
-        : safe_execve(exe, argp, envp);
-    ret = get_errno(ret);
+#ifdef TARGET_X86_64
+    if (kvm_user_enabled) {
+        /*
+         * Re-exec through qemu itself so a same-arch child stays under KVM
+         * emulation instead of running natively (escaping our syscall layer).
+         * Reconstruct the qemu invocation for an ELF:
+         *   /proc/self/exe  argv0="qemu-kvm" -0 <guest argv0> <exe> <args...>
+         * and, for a "#!" script (which qemu's loader can't handle), expand the
+         * shebang like the kernel's binfmt_script:
+         *   ... -0 <interp> <interp> [<shebang-arg>] <script> <args...>
+         * argv[0]=="qemu-kvm" re-enables KVM mode; QEMU_KVM=1 is added too.
+         */
+        char fdpath[64];
+        const char *target = exe;
+        if (is_execveat && exe[0] != '/' && dirfd != AT_FDCWD) {
+            /* best-effort for dirfd-relative execveat (absolute/AT_FDCWD common) */
+            snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", dirfd);
+            target = (exe[0] == '\0') ? fdpath : exe;
+        }
+
+        /* Detect and parse a shebang line. */
+        char sb_interp[256], sb_arg[256];
+        bool is_script = false, has_sb_arg = false;
+        int sfd = open(target, O_RDONLY | O_CLOEXEC);
+        if (sfd >= 0) {
+            char hdr[258];
+            ssize_t n = read(sfd, hdr, sizeof(hdr) - 1);
+            close(sfd);
+            if (n >= 2 && hdr[0] == '#' && hdr[1] == '!') {
+                hdr[n] = '\0';
+                char *nl = strchr(hdr, '\n');
+                if (nl) {
+                    *nl = '\0';
+                }
+                char *s = hdr + 2;
+                while (*s == ' ' || *s == '\t') {
+                    s++;
+                }
+                char *e = s;
+                while (*e && *e != ' ' && *e != '\t') {
+                    e++;
+                }
+                if (e > s) {
+                    size_t len = MIN((size_t)(e - s), sizeof(sb_interp) - 1);
+                    memcpy(sb_interp, s, len);
+                    sb_interp[len] = '\0';
+                    is_script = true;
+                    while (*e == ' ' || *e == '\t') {
+                        e++;
+                    }
+                    if (*e) {           /* single optional argument (rest of line) */
+                        pstrcpy(sb_arg, sizeof(sb_arg), e);
+                        has_sb_arg = true;
+                    }
+                }
+            }
+        }
+
+        int na = 0;
+        while (argp[na]) {
+            na++;
+        }
+        char **nargp = g_new0(char *, na + 7);
+        int j = 0;
+        nargp[j++] = (char *)"qemu-kvm";
+        nargp[j++] = (char *)"-0";
+        if (is_script) {
+            nargp[j++] = sb_interp;      /* guest argv0 = interpreter */
+            nargp[j++] = sb_interp;      /* exec_path = interpreter   */
+            if (has_sb_arg) {
+                nargp[j++] = sb_arg;
+            }
+            nargp[j++] = (char *)target; /* script path */
+            for (int i = 1; i < na; i++) {
+                nargp[j++] = argp[i];    /* drop original argv0 */
+            }
+        } else {
+            nargp[j++] = na > 0 ? argp[0] : (char *)target;
+            nargp[j++] = (char *)target;
+            for (int i = 1; i < na; i++) {
+                nargp[j++] = argp[i];
+            }
+        }
+        nargp[j] = NULL;
+
+        int ne = 0;
+        bool have_kvm = false;
+        while (envp[ne]) {
+            if (!strncmp(envp[ne], "QEMU_KVM=", 9)) {
+                have_kvm = true;
+            }
+            ne++;
+        }
+        char **nenvp = g_new0(char *, ne + 2);
+        for (int i = 0; i < ne; i++) {
+            nenvp[i] = envp[i];
+        }
+        if (!have_kvm) {
+            nenvp[ne++] = (char *)"QEMU_KVM=1";
+        }
+        nenvp[ne] = NULL;
+
+        ret = get_errno(safe_execve("/proc/self/exe", nargp, nenvp));
+        g_free(nargp);
+        g_free(nenvp);
+    } else
+#endif
+    {
+        ret = is_execveat
+            ? safe_execveat(dirfd, exe, argp, envp, flags)
+            : safe_execve(exe, argp, envp);
+        ret = get_errno(ret);
+    }
 
     unlock_user(p, pathname, 0);
 

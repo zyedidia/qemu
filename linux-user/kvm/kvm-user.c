@@ -670,6 +670,56 @@ void kvm_user_park_vcpu(CPUState *cs)
     cs->accel = NULL;
 }
 
+/*
+ * fork() support.  KVM fds are bound to the parent's mm and are useless in the
+ * child, so the child rebuilds its VM/slots/vCPU from scratch.  The control
+ * region (page tables + nanokernel) and all guest memory are COW-preserved at
+ * the same host addresses, so only the KVM objects need recreating.
+ */
+
+/* Parent side, before fork(): snapshot live FP into env so the child (COW)
+ * inherits it and can push it to its rebuilt vCPU. */
+void kvm_user_fork_start(void)
+{
+    if (current_cpu) {
+        kvm_user_get_fpu(current_cpu);
+    }
+}
+
+/* Child side, after fork(): the only surviving thread rebuilds the VM. */
+void kvm_user_fork_child(CPUState *cs)
+{
+    /* Inherited fds refer to the parent's VM; drop this thread's and the VM's. */
+    close(cs->kvm_fd);
+    close(vm_fd);
+    close(kvm_fd);
+    g_free(vcpu_of(cs));            /* COW copy of parent's per-vCPU struct */
+    cs->accel = NULL;
+    cs->kvm_run = NULL;
+
+    /* Reset VM-global bookkeeping (other threads are gone in the child). */
+    next_slot = 0;
+    next_vcpu_id = 0;
+    parked_list = NULL;
+    memset(chunk_present, 0, (NUM_CHUNKS + 7) / 8);
+
+    kvm_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+    if (kvm_fd < 0) {
+        perror("qemu-kvm: fork child open /dev/kvm");
+        _exit(1);
+    }
+    vm_fd = kvm_ioctl(kvm_fd, KVM_CREATE_VM, (void *)0, "KVM_CREATE_VM");
+
+    /* Control region content is COW-preserved; just re-slot it and the guest
+     * mappings (page tables / nanokernel need no rebuild). */
+    add_memslot(next_slot++, CTRL_GPA, (uint64_t)(uintptr_t)ctrl, CTRL_SIZE);
+    walk_memory_regions(NULL, mirror_region_cb);
+
+    kvm_user_init_vcpu(cs);
+    kvm_user_put_fpu(cs);          /* restore the inherited FP snapshot */
+    DBG("fork child rebuilt VM (vm_fd=%d)\n", vm_fd);
+}
+
 void kvm_user_setup(CPUState *cs)
 {
     kvm_debug = getenv("QEMU_KVM_DEBUG") != NULL;

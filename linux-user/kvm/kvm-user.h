@@ -56,6 +56,11 @@ void kvm_user_park_vcpu(CPUState *cs);
 
 /* Force another vCPU thread out of KVM_RUN (start_exclusive). */
 void kvm_user_kick(CPUState *cs);
+
+/* fork() support: snapshot FP in the parent before fork; rebuild the VM in the
+ * child (KVM fds don't survive fork). */
+void kvm_user_fork_start(void);
+void kvm_user_fork_child(CPUState *cs);
 #endif /* TARGET_X86_64 */
 
 #endif /* LINUX_USER_KVM_USER_H */
