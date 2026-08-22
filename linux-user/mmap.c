@@ -29,6 +29,7 @@
 #include "user-mmap.h"
 #include "target_mman.h"
 #include "qemu/interval-tree.h"
+#include "kvm/kvm-user.h"
 
 #ifdef TARGET_ARM
 #include "target/arm/cpu-features.h"
@@ -275,6 +276,13 @@ int target_mprotect(abi_ulong start, abi_ulong len, int target_prot)
 
  error:
     mmap_unlock();
+#ifdef TARGET_X86_64
+    /* A PROT_NONE->readable transition (commit into a reservation) needs KVM
+     * slots for the now-accessible range. */
+    if (ret == 0 && kvm_user_enabled && (target_prot & PROT_READ)) {
+        kvm_user_track_range(start, len);
+    }
+#endif
     return ret;
 }
 
@@ -1009,6 +1017,14 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int target_prot,
 
     mmap_unlock();
 
+#ifdef TARGET_X86_64
+    /* Ensure the KVM guest can reach the newly mapped range.  Skip PROT_NONE
+     * reservations (no backing; a guest access faults, which is correct). */
+    if (ret != -1 && kvm_user_enabled && (target_prot & PROT_READ)) {
+        kvm_user_track_range(ret, len);
+    }
+#endif
+
     /*
      * If we're mapping shared memory, ensure we generate code for parallel
      * execution and flush old translations.  This will work up to the level
@@ -1253,6 +1269,11 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
         shm_region_rm_complete(new_addr, new_addr + new_size - 1);
     }
     mmap_unlock();
+#ifdef TARGET_X86_64
+    if (new_addr != -1 && kvm_user_enabled) {
+        kvm_user_track_range(new_addr, new_size);
+    }
+#endif
     return new_addr;
 }
 

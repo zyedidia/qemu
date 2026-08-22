@@ -92,6 +92,10 @@ static int kvm_debug;
 #define CR4_OSFXSR     0x200
 #define CR4_OSXMMEXCPT 0x400
 #define CR4_FSGSBASE   0x10000
+#define CR4_OSXSAVE    0x40000
+
+/* XCR0 feature bits enabled at start (SIMD on): x87 | SSE | AVX. */
+#define XCR0_INIT      0x7
 #define EFER_SCE 0x1
 #define EFER_LME 0x100
 #define EFER_LMA 0x400
@@ -105,6 +109,19 @@ static int kvm_debug;
  * vsyscall page) are not real host mappings and are handled specially. */
 #define USER_VA_END  0x00007ffffffff000ULL
 
+/*
+ * Memslots are created at 1 GiB "chunk" granularity, on demand, and never
+ * removed.  A chunk slot is identity (userspace_addr == guest_phys_addr), so
+ * whichever host pages are actually mapped within it just work, and holes
+ * (unmapped / munmap'd / PROT_NONE) fail GUP -> -EFAULT.  This keeps per-page
+ * KVM metadata proportional to the chunks the guest touches, and means
+ * munmap/mprotect need no slot bookkeeping at all (the host mapping and its
+ * protection are the source of truth via GUP).
+ */
+#define CHUNK_BITS  30
+#define CHUNK_SIZE  (1ULL << CHUNK_BITS)
+#define NUM_CHUNKS  (USER_VA_END >> CHUNK_BITS)
+
 /* ------------------------------------------------------------------ */
 /* Global VM state (M1: one VM, one vCPU)                             */
 /* ------------------------------------------------------------------ */
@@ -115,6 +132,7 @@ static uint8_t *ctrl;                 /* host mapping of the control region */
 static uint8_t *nano;                 /* = ctrl + NANO_OFF                  */
 static uint64_t cr3_gpa;              /* guest-physical of PML4             */
 static uint32_t next_slot;
+static uint8_t *chunk_present;        /* bitmap: which 1GiB chunks have slots */
 
 /* fs/gs base last pushed to the vCPU, to avoid needless MSR writes. */
 static uint64_t cached_fs_base = ~0ULL, cached_gs_base = ~0ULL;
@@ -146,20 +164,57 @@ static void add_memslot(uint32_t slot, uint64_t gpa, uint64_t hva, uint64_t size
               "KVM_SET_USER_MEMORY_REGION");
 }
 
-/* walk_memory_regions callback: mirror each guest page-flags region as a slot.
- * guest_base == 0, so guest-physical == userspace address (identity). */
+/* Ensure a memslot exists for the 1GiB chunk containing gpa. */
+static void ensure_chunk(uint64_t gpa)
+{
+    uint64_t c = gpa >> CHUNK_BITS;
+
+    if (c >= NUM_CHUNKS) {
+        return;                                 /* kernel-half / vsyscall etc. */
+    }
+    if (chunk_present[c >> 3] & (1u << (c & 7))) {
+        return;
+    }
+    chunk_present[c >> 3] |= (1u << (c & 7));
+
+    uint64_t base = c << CHUNK_BITS;
+    uint64_t size = MIN(CHUNK_SIZE, USER_VA_END - base);
+    add_memslot(next_slot++, base, base, size);
+    DBG("  chunk slot %u: [0x%llx, +0x%llx)\n", next_slot - 1,
+        (unsigned long long)base, (unsigned long long)size);
+}
+
+/*
+ * Ensure memslots cover [start, start+len).  Called from the mmap layer for
+ * every new/moved guest mapping, and at setup for the load-time mappings.
+ * No-op until the VM exists (early target_mmap during ELF load is covered by
+ * the setup-time walk below).
+ */
+void kvm_user_track_range(uint64_t start, uint64_t len)
+{
+    if (!kvm_user_enabled || vm_fd < 0 || len == 0) {
+        return;
+    }
+    uint64_t end = start + len;
+    for (uint64_t g = start & ~(CHUNK_SIZE - 1); g < end; g += CHUNK_SIZE) {
+        ensure_chunk(g);
+    }
+}
+
 static int mirror_region_cb(void *priv, vaddr start, vaddr end, int flags)
 {
-    /* Skip kernel-half / non-backed regions (e.g. the vsyscall page): their
-     * identity userspace_addr is not a valid host mapping. */
-    if (start >= USER_VA_END) {
-        DBG("  skip: [0x%llx, 0x%llx) flags=0x%x\n",
+    /*
+     * Only slot readable memory.  PROT_NONE reservations (which can span many
+     * TiB, e.g. a PIE/ld.so address-space reservation) get no slot: a guest
+     * access to them correctly faults (KVM_EXIT_MMIO -> SIGSEGV), and when the
+     * guest later mprotect()s a sub-range readable, the mprotect hook slots it.
+     */
+    if (!(flags & PAGE_READ)) {
+        DBG("  skip non-readable [0x%llx, 0x%llx) flags=0x%x\n",
             (unsigned long long)start, (unsigned long long)end, flags);
         return 0;
     }
-    DBG("  slot: [0x%llx, 0x%llx) flags=0x%x\n",
-        (unsigned long long)start, (unsigned long long)end, flags);
-    add_memslot(next_slot++, start, start, end - start);
+    kvm_user_track_range(start, end - start);
     return 0;
 }
 
@@ -174,6 +229,8 @@ static void setup_memory(void)
     }
     nano = ctrl + NANO_OFF;
     add_memslot(next_slot++, CTRL_GPA, (uint64_t)(uintptr_t)ctrl, CTRL_SIZE);
+
+    chunk_present = g_malloc0((NUM_CHUNKS + 7) / 8);
 
     /* Mirror the guest mappings that exist at load time. */
     walk_memory_regions(NULL, mirror_region_cb);
@@ -327,7 +384,8 @@ static void setup_sregs(CPUState *cs, CPUX86State *env)
 
     sregs.cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | CR0_PG;
     sregs.cr3 = cr3_gpa;
-    sregs.cr4 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_FSGSBASE;
+    sregs.cr4 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_FSGSBASE |
+                CR4_OSXSAVE;
     sregs.efer = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE;
     sregs.cr8 = 0;
 
@@ -355,6 +413,17 @@ static void setup_msrs(CPUState *cs)
             ((uint64_t)SEL_DATA << 48) | ((uint64_t)SEL_CODE << 32));
     set_msr(cs, MSR_LSTAR, NANO_VA_BASE + OFF_SYSCALL_STUB);
     set_msr(cs, MSR_SFMASK, 0x257fd5);   /* mask like the Linux kernel entry */
+}
+
+static void setup_xcrs(CPUState *cs)
+{
+    /* Enable x87|SSE|AVX in XCR0 so the guest can use AVX/AVX2 (SIMD on).
+     * Must follow KVM_SET_CPUID2 (KVM validates XCR0 against CPUID leaf 0xD). */
+    struct kvm_xcrs xcrs = { 0 };
+    xcrs.nr_xcrs = 1;
+    xcrs.xcrs[0].xcr = 0;
+    xcrs.xcrs[0].value = XCR0_INIT;
+    kvm_ioctl(cs->kvm_fd, KVM_SET_XCRS, &xcrs, "KVM_SET_XCRS");
 }
 
 static void setup_cpuid(CPUState *cs)
@@ -490,6 +559,8 @@ void kvm_user_setup(CPUState *cs)
 
     setup_sregs(cs, env);
     DBG("sregs done\n");
+    setup_xcrs(cs);
+    DBG("xcrs done\n");
     setup_msrs(cs);
     DBG("msrs done\n");
 

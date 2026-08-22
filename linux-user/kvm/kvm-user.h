@@ -30,6 +30,13 @@ void kvm_user_setup(CPUState *cs);
  * for cpu_exec() on the KVM path.
  */
 int kvm_cpu_exec_user(CPUState *cs);
+
+/*
+ * Ensure KVM memslots cover [start, start+len).  Called from the mmap layer
+ * whenever a new/moved guest mapping appears.  No-op unless KVM mode is active
+ * and the VM has been created.
+ */
+void kvm_user_track_range(uint64_t start, uint64_t len);
 #endif /* TARGET_X86_64 */
 
 #endif /* LINUX_USER_KVM_USER_H */
