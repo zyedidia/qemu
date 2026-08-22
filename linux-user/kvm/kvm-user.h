@@ -45,6 +45,17 @@ void kvm_user_track_range(uint64_t start, uint64_t len);
  */
 void kvm_user_get_fpu(CPUState *cs);
 void kvm_user_put_fpu(CPUState *cs);
+
+/*
+ * Per-thread vCPU lifecycle.  init_vcpu creates (or recycles a parked) vCPU for
+ * a guest thread and primes it from env; call on the owning thread under
+ * clone_lock.  park_vcpu recycles an exiting thread's vCPU.
+ */
+void kvm_user_init_vcpu(CPUState *cs);
+void kvm_user_park_vcpu(CPUState *cs);
+
+/* Force another vCPU thread out of KVM_RUN (start_exclusive). */
+void kvm_user_kick(CPUState *cs);
 #endif /* TARGET_X86_64 */
 
 #endif /* LINUX_USER_KVM_USER_H */

@@ -140,6 +140,7 @@
 #include "user/page-protection.h"
 #include "user/safe-syscall.h"
 #include "user/signal.h"
+#include "kvm/kvm-user.h"
 #include "qemu/guest-random.h"
 #include "user/selfmap.h"
 #include "special-errno.h"
@@ -6957,6 +6958,12 @@ static void *clone_func(void *arg)
     /* Wait until the parent has finished initializing the tls state.  */
     pthread_mutex_lock(&clone_lock);
     pthread_mutex_unlock(&clone_lock);
+#ifdef TARGET_X86_64
+    /* Create this thread's KVM vCPU (must run on the owning thread). */
+    if (kvm_user_enabled) {
+        kvm_user_init_vcpu(cpu);
+    }
+#endif
     cpu_loop(env);
     /* never exits */
     return NULL;
@@ -9797,6 +9804,13 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 #ifdef TARGET_AARCH64
             if (ts->gcs_base) {
                 target_munmap(ts->gcs_base, ts->gcs_size);
+            }
+#endif
+
+#ifdef TARGET_X86_64
+            /* Recycle this thread's vCPU (KVM can't destroy vCPUs). */
+            if (kvm_user_enabled) {
+                kvm_user_park_vcpu(cpu);
             }
 #endif
 

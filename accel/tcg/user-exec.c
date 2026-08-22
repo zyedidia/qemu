@@ -48,8 +48,19 @@ __thread uintptr_t helper_retaddr;
 
 //#define DEBUG_SIGNAL
 
+/*
+ * Optional kick override, installed by the KVM-user backend (which can't be
+ * referenced from this target-macro-poisoned TU).  When set, a vCPU may be
+ * blocked inside KVM_RUN where tcg_kick_vcpu_thread's flag won't reach it.
+ */
+void (*qemu_cpu_kick_hook)(CPUState *cpu);
+
 void qemu_cpu_kick(CPUState *cpu)
 {
+    if (qemu_cpu_kick_hook) {
+        qemu_cpu_kick_hook(cpu);
+        return;
+    }
     tcg_kick_vcpu_thread(cpu);
 }
 

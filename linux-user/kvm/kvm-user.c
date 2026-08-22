@@ -40,6 +40,8 @@
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include "user/signal.h"
 
 bool kvm_user_enabled;
 
@@ -134,8 +136,29 @@ static uint64_t cr3_gpa;              /* guest-physical of PML4             */
 static uint32_t next_slot;
 static uint8_t *chunk_present;        /* bitmap: which 1GiB chunks have slots */
 
-/* fs/gs base last pushed to the vCPU, to avoid needless MSR writes. */
-static uint64_t cached_fs_base = ~0ULL, cached_gs_base = ~0ULL;
+/* Per-vCPU (per guest thread) state, hung off CPUState::accel. */
+typedef struct KVMUserVCPU {
+    int vcpu_id;
+    uint64_t cached_fs_base;          /* fs/gs base last pushed, to skip MSR writes */
+    uint64_t cached_gs_base;
+    struct kvm_xsave xsave_scratch;   /* scratch for FP get/put around signals */
+} KVMUserVCPU;
+
+static inline KVMUserVCPU *vcpu_of(CPUState *cs)
+{
+    return (KVMUserVCPU *)cs->accel;
+}
+
+/* vCPU id allocation + parking (KVM can't destroy vCPUs, so recycle fds). */
+static int next_vcpu_id;
+typedef struct ParkedVCPU {
+    int vcpu_id;
+    int fd;
+    struct kvm_run *run;
+    struct ParkedVCPU *next;
+} ParkedVCPU;
+static ParkedVCPU *parked_list;
+/* clone_lock (held around thread create/exit) also serializes these. */
 
 static int kvm_ioctl(int fd, int req, void *arg, const char *what)
 {
@@ -390,8 +413,8 @@ static void setup_sregs(CPUState *cs, CPUX86State *env)
     sregs.cr8 = 0;
 
     kvm_ioctl(cs->kvm_fd, KVM_SET_SREGS, &sregs, "KVM_SET_SREGS");
-    cached_fs_base = env->segs[R_FS].base;
-    cached_gs_base = env->segs[R_GS].base;
+    vcpu_of(cs)->cached_fs_base = env->segs[R_FS].base;
+    vcpu_of(cs)->cached_gs_base = env->segs[R_GS].base;
 }
 
 static void set_msr(CPUState *cs, uint32_t index, uint64_t data)
@@ -467,13 +490,14 @@ static void sync_to_vcpu(CPUState *cs, CPUX86State *env)
     run->kvm_dirty_regs = KVM_SYNC_X86_REGS;
 
     /* Push FS/GS base if arch_prctl (etc.) changed it on the host side. */
-    if (env->segs[R_FS].base != cached_fs_base) {
+    KVMUserVCPU *v = vcpu_of(cs);
+    if (env->segs[R_FS].base != v->cached_fs_base) {
         set_msr(cs, MSR_FS_BASE, env->segs[R_FS].base);
-        cached_fs_base = env->segs[R_FS].base;
+        v->cached_fs_base = env->segs[R_FS].base;
     }
-    if (env->segs[R_GS].base != cached_gs_base) {
+    if (env->segs[R_GS].base != v->cached_gs_base) {
         set_msr(cs, MSR_GS_BASE, env->segs[R_GS].base);
-        cached_gs_base = env->segs[R_GS].base;
+        v->cached_gs_base = env->segs[R_GS].base;
     }
 }
 
@@ -483,21 +507,19 @@ static void sync_to_vcpu(CPUState *cs, CPUX86State *env)
  * from the signal frame), so sync it lazily exactly around those points.
  * (M3: single scratch buffer; per-vCPU in M4.)
  */
-static struct kvm_xsave kvm_xsave_scratch;
-
 void kvm_user_get_fpu(CPUState *cs)
 {
-    kvm_ioctl(cs->kvm_fd, KVM_GET_XSAVE, &kvm_xsave_scratch, "KVM_GET_XSAVE");
-    x86_cpu_xrstor_all_areas(X86_CPU(cs), &kvm_xsave_scratch,
-                             sizeof(kvm_xsave_scratch.region));
+    struct kvm_xsave *buf = &vcpu_of(cs)->xsave_scratch;
+    kvm_ioctl(cs->kvm_fd, KVM_GET_XSAVE, buf, "KVM_GET_XSAVE");
+    x86_cpu_xrstor_all_areas(X86_CPU(cs), buf, sizeof(buf->region));
 }
 
 void kvm_user_put_fpu(CPUState *cs)
 {
-    memset(&kvm_xsave_scratch, 0, sizeof(kvm_xsave_scratch));
-    x86_cpu_xsave_all_areas(X86_CPU(cs), &kvm_xsave_scratch,
-                            sizeof(kvm_xsave_scratch.region));
-    kvm_ioctl(cs->kvm_fd, KVM_SET_XSAVE, &kvm_xsave_scratch, "KVM_SET_XSAVE");
+    struct kvm_xsave *buf = &vcpu_of(cs)->xsave_scratch;
+    memset(buf, 0, sizeof(*buf));
+    x86_cpu_xsave_all_areas(X86_CPU(cs), buf, sizeof(buf->region));
+    kvm_ioctl(cs->kvm_fd, KVM_SET_XSAVE, buf, "KVM_SET_XSAVE");
 }
 
 static void sync_from_vcpu(CPUState *cs, CPUX86State *env)
@@ -531,10 +553,125 @@ static void sync_from_vcpu(CPUState *cs, CPUX86State *env)
 /* Setup entry point                                                  */
 /* ------------------------------------------------------------------ */
 
-void kvm_user_setup(CPUState *cs)
+/*
+ * Create (or recycle a parked) vCPU for this guest thread and prime all of its
+ * control state from env.  Runs on the owning thread.  Called for the main
+ * thread from kvm_user_setup() and for each new guest thread from clone_func().
+ * Must be serialized (the callers hold clone_lock) w.r.t. vcpu-id/parking.
+ */
+void kvm_user_init_vcpu(CPUState *cs)
 {
     CPUX86State *env = cpu_env(cs);
+    KVMUserVCPU *v = g_new0(KVMUserVCPU, 1);
+    cs->accel = (AccelCPUState *)v;
+    v->cached_fs_base = ~0ULL;
+    v->cached_gs_base = ~0ULL;
 
+    /* Recycle a parked vCPU if any, else create a fresh one. */
+    ParkedVCPU *p = parked_list;
+    if (p) {
+        parked_list = p->next;
+        v->vcpu_id = p->vcpu_id;
+        cs->kvm_fd = p->fd;
+        cs->kvm_run = p->run;
+        g_free(p);
+        DBG("vcpu recycled id=%d fd=%d\n", v->vcpu_id, cs->kvm_fd);
+    } else {
+        v->vcpu_id = next_vcpu_id++;
+        cs->kvm_fd = kvm_ioctl(vm_fd, KVM_CREATE_VCPU,
+                               (void *)(intptr_t)v->vcpu_id, "KVM_CREATE_VCPU");
+        int mmap_size = kvm_ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, (void *)0,
+                                  "KVM_GET_VCPU_MMAP_SIZE");
+        cs->kvm_run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                           cs->kvm_fd, 0);
+        if (cs->kvm_run == MAP_FAILED) {
+            perror("qemu-kvm: mmap kvm_run");
+            _exit(1);
+        }
+        /* CPUID is immutable after first KVM_RUN, so set it once at creation. */
+        setup_cpuid(cs);
+        DBG("vcpu created id=%d fd=%d\n", v->vcpu_id, cs->kvm_fd);
+    }
+
+    {
+        struct kvm_mp_state mp = { .mp_state = KVM_MP_STATE_RUNNABLE };
+        kvm_ioctl(cs->kvm_fd, KVM_SET_MP_STATE, &mp, "KVM_SET_MP_STATE");
+    }
+
+    setup_sregs(cs, env);
+    setup_xcrs(cs);
+    setup_msrs(cs);
+
+    /* env->eflags is authoritative; keep the CC lazy-flags machinery inert. */
+    env->cc_op = CC_OP_EFLAGS;
+    env->cc_src = 0;
+    env->df = 1;
+
+    /*
+     * start_exclusive() (fork, exit->plugin, core dump, ...) dereferences
+     * current_cpu, which normally is only set inside TCG's cpu_exec().  Set it
+     * for this thread so those paths work on the KVM path too.
+     */
+    current_cpu = cs;
+
+    cs->kvm_run->kvm_valid_regs = KVM_SYNC_X86_REGS;
+
+    DBG("vcpu %d ready: rip=0x%llx rsp=0x%llx\n", v->vcpu_id,
+        (unsigned long long)env->eip, (unsigned long long)env->regs[R_ESP]);
+}
+
+/*
+ * Force another vCPU thread out of KVM_RUN (for start_exclusive: fork, core
+ * dump).  Sets immediate_exit so an about-to-enter KVM_RUN returns at once, and
+ * sends host_interrupt_signal so a thread already inside KVM_RUN returns -EINTR.
+ */
+void kvm_user_kick(CPUState *cs)
+{
+    /*
+     * start_exclusive() calls qemu_cpu_kick() directly (not via cpu_exit), so
+     * set exit_request here too; the run loop acquire-loads it after clearing
+     * immediate_exit.
+     */
+    qatomic_set(&cs->exit_request, true);
+    if (cs->kvm_run) {
+        qatomic_set(&cs->kvm_run->immediate_exit, 1);
+    }
+    /*
+     * Only signal OTHER threads.  Kicking ourselves (e.g. cpu_exit() from our
+     * own host signal handler) must not tgkill self -- that would re-enter the
+     * handler forever; exit_request/immediate_exit already handle the self case.
+     */
+    if (cs != current_cpu) {
+        TaskState *ts = get_task_state(cs);
+        if (ts && host_interrupt_signal) {
+            syscall(__NR_tgkill, getpid(), ts->ts_tid, host_interrupt_signal);
+        }
+    }
+}
+
+/* Installed as qemu_cpu_kick_hook so start_exclusive can evict KVM vCPUs. */
+extern void (*qemu_cpu_kick_hook)(CPUState *cpu);
+
+/* Park an exiting thread's vCPU for reuse (KVM has no destroy-vcpu). */
+void kvm_user_park_vcpu(CPUState *cs)
+{
+    KVMUserVCPU *v = vcpu_of(cs);
+    if (!v) {
+        return;
+    }
+    ParkedVCPU *p = g_new0(ParkedVCPU, 1);
+    p->vcpu_id = v->vcpu_id;
+    p->fd = cs->kvm_fd;
+    p->run = cs->kvm_run;
+    p->next = parked_list;
+    parked_list = p;
+    DBG("vcpu parked id=%d\n", v->vcpu_id);
+    g_free(v);
+    cs->accel = NULL;
+}
+
+void kvm_user_setup(CPUState *cs)
+{
     kvm_debug = getenv("QEMU_KVM_DEBUG") != NULL;
 
     if (guest_base != 0) {
@@ -558,51 +695,11 @@ void kvm_user_setup(CPUState *cs)
     setup_nanokernel();
     DBG("nanokernel done\n");
 
-    cs->kvm_fd = kvm_ioctl(vm_fd, KVM_CREATE_VCPU, (void *)0, "KVM_CREATE_VCPU");
-    DBG("vcpu created (fd=%d)\n", cs->kvm_fd);
+    /* Route qemu_cpu_kick() to the KVM eviction path (start_exclusive). */
+    qemu_cpu_kick_hook = kvm_user_kick;
 
-    int mmap_size = kvm_ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, (void *)0,
-                              "KVM_GET_VCPU_MMAP_SIZE");
-    cs->kvm_run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                       cs->kvm_fd, 0);
-    if (cs->kvm_run == MAP_FAILED) {
-        perror("qemu-kvm: mmap kvm_run");
-        _exit(1);
-    }
-    DBG("kvm_run mapped\n");
-
-    /* Order matters: CPUID before sregs/msrs (KVM validates CR4/EFER/XCR0). */
-    setup_cpuid(cs);
-    DBG("cpuid done\n");
-
-    {
-        struct kvm_mp_state mp = { .mp_state = KVM_MP_STATE_RUNNABLE };
-        kvm_ioctl(cs->kvm_fd, KVM_SET_MP_STATE, &mp, "KVM_SET_MP_STATE");
-    }
-
-    setup_sregs(cs, env);
-    DBG("sregs done\n");
-    setup_xcrs(cs);
-    DBG("xcrs done\n");
-    setup_msrs(cs);
-    DBG("msrs done\n");
-
-    /* env->eflags is authoritative; keep the CC lazy-flags machinery inert. */
-    env->cc_op = CC_OP_EFLAGS;
-    env->cc_src = 0;
-    env->df = 1;
-
-    /*
-     * start_exclusive() (fork, exit->plugin, core dump, ...) dereferences
-     * current_cpu, which normally is only set inside TCG's cpu_exec().  Set it
-     * for this thread so those paths work on the KVM path too.
-     */
-    current_cpu = cs;
-
-    cs->kvm_run->kvm_valid_regs = KVM_SYNC_X86_REGS;
-
-    DBG("setup done: entry rip=0x%llx rsp=0x%llx\n",
-        (unsigned long long)env->eip, (unsigned long long)env->regs[R_ESP]);
+    kvm_user_init_vcpu(cs);
+    DBG("setup done\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -811,11 +908,12 @@ int kvm_cpu_exec_user(CPUState *cs)
         sync_to_vcpu(cs, env);
 
         /*
-         * If a host signal already arrived (host_signal_handler set
-         * signal_pending + exit_request), or an exclusive-section kick is
-         * pending, handle it instead of entering the guest.  Closes the race
-         * where a signal lands between here and KVM_RUN.
+         * Kick-race discipline (mirrors accel/kvm): clear immediate_exit, THEN
+         * acquire-load exit_request/signal_pending.  A kicker sets exit_request
+         * before immediate_exit, so either we observe exit_request here, or the
+         * kicker's immediate_exit=1 makes the KVM_RUN below return -EINTR.
          */
+        qatomic_set(&cs->kvm_run->immediate_exit, 0);
         if (qatomic_read(&cs->exit_request) ||
             qatomic_read(&get_task_state(cs)->signal_pending)) {
             return EXCP_INTERRUPT;
