@@ -70,6 +70,15 @@ void kvm_user_kick(CPUState *cs);
  * child (KVM fds don't survive fork). */
 void kvm_user_fork_start(void);
 void kvm_user_fork_child(CPUState *cs);
+
+/* True if fd is a guest-invisible internal KVM fd that a guest close()/dup2()
+ * must not touch (would tear down the VM). */
+bool kvm_user_is_internal_fd(int fd);
+/* Smallest internal fd >= from, or -1 (for close_range splitting). */
+int kvm_user_next_internal_fd(int from);
+
+/* Print a per-process VM-exit summary if QEMU_KVM_STATS is set (called at exit). */
+void kvm_user_dump_stats(void);
 #endif /* TARGET_X86_64 */
 
 #endif /* LINUX_USER_KVM_USER_H */

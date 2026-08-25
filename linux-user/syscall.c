@@ -10041,10 +10041,47 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         return get_errno(pidfd_getfd(arg1, arg2, arg3));
 #endif
     case TARGET_NR_close:
+#ifdef TARGET_X86_64
+        /* Never let the guest close our internal KVM fds. */
+        if (kvm_user_enabled && kvm_user_is_internal_fd(arg1)) {
+            return 0;
+        }
+#endif
         fd_trans_unregister(arg1);
         return get_errno(close(arg1));
 #if defined(__NR_close_range) && defined(TARGET_NR_close_range)
     case TARGET_NR_close_range:
+#ifdef TARGET_X86_64
+        /* Close the range in sub-ranges that skip our internal KVM fds. */
+        if (kvm_user_enabled) {
+            unsigned lo = arg1;
+            ret = 0;
+            while (lo <= (unsigned)arg2) {
+                int pfd = kvm_user_next_internal_fd(lo);
+                unsigned hi = (pfd < 0 || (unsigned)pfd > (unsigned)arg2)
+                              ? (unsigned)arg2 : (unsigned)pfd - 1;
+                if (lo <= hi) {
+                    ret = get_errno(sys_close_range(lo, hi, arg3));
+                    if (ret != 0) {
+                        break;
+                    }
+                }
+                if (pfd < 0 || (unsigned)pfd > (unsigned)arg2) {
+                    break;
+                }
+                lo = (unsigned)pfd + 1;
+            }
+            if (ret == 0 && !(arg3 & CLOSE_RANGE_CLOEXEC)) {
+                abi_long fd, maxfd = MIN(arg2, target_fd_max);
+                for (fd = arg1; fd < maxfd; fd++) {
+                    if (!kvm_user_is_internal_fd(fd)) {
+                        fd_trans_unregister(fd);
+                    }
+                }
+            }
+            return ret;
+        }
+#endif
         ret = get_errno(sys_close_range(arg1, arg2, arg3));
         if (ret == 0 && !(arg3 & CLOSE_RANGE_CLOEXEC)) {
             abi_long fd, maxfd;
@@ -10602,6 +10639,12 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         return ret;
 #ifdef TARGET_NR_dup2
     case TARGET_NR_dup2:
+#ifdef TARGET_X86_64
+        /* Don't let the guest dup over one of our internal KVM fds. */
+        if (kvm_user_enabled && kvm_user_is_internal_fd(arg2)) {
+            return -TARGET_EBADF;
+        }
+#endif
         ret = get_errno(dup2(arg1, arg2));
         if (ret >= 0) {
             fd_trans_dup(arg1, arg2);
@@ -10616,6 +10659,11 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
         if ((arg3 & ~TARGET_O_CLOEXEC) != 0) {
             return -EINVAL;
         }
+#ifdef TARGET_X86_64
+        if (kvm_user_enabled && kvm_user_is_internal_fd(arg2)) {
+            return -TARGET_EBADF;
+        }
+#endif
         host_flags = target_to_host_bitmask(arg3, fcntl_flags_tbl);
         ret = get_errno(dup3(arg1, arg2, host_flags));
         if (ret >= 0) {

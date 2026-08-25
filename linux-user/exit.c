@@ -22,6 +22,9 @@
 #include "qemu.h"
 #include "user-internals.h"
 #include "qemu/plugin.h"
+#ifdef TARGET_X86_64
+#include "kvm/kvm-user.h"
+#endif
 
 #ifdef CONFIG_GCOV
 extern void __gcov_dump(void);
@@ -35,4 +38,9 @@ void preexit_cleanup(CPUArchState *env, int code)
         gdb_exit(code);
         qemu_plugin_user_exit();
         perf_exit();
+#ifdef TARGET_X86_64
+        if (kvm_user_enabled) {
+            kvm_user_dump_stats();
+        }
+#endif
 }

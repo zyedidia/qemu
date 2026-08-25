@@ -57,6 +57,10 @@ bool kvm_user_enabled;
 static int kvm_debug;
 #define DBG(...) do { if (kvm_debug) { fprintf(stderr, "qemu-kvm: " __VA_ARGS__); } } while (0)
 
+/* VM-exit accounting (QEMU_KVM_STATS=1 to print a per-process summary). */
+static int kvm_stats;
+static uint64_t st_syscall, st_fault, st_eintr, st_exc, st_other, st_total;
+
 /* ------------------------------------------------------------------ */
 /* Control region: guest page tables + nanokernel, in GPA chunk 0.     */
 /* ------------------------------------------------------------------ */
@@ -203,6 +207,94 @@ static int kvm_ioctl(int fd, int req, void *arg, const char *what)
         _exit(1);
     }
     return r;
+}
+
+/*
+ * Guest-invisible host fds (/dev/kvm, VM, vCPUs) must survive the guest's own
+ * close()/close_range() (Firefox's content process closes "superfluous" fds for
+ * sandbox hygiene, which would otherwise tear down our VM).  Track them so the
+ * syscall layer can refuse guest closes.
+ */
+static bool *prot_fds;
+static int prot_cap;
+
+static void kvm_mark_fd(int fd, bool v)
+{
+    if (fd < 0) {
+        return;
+    }
+    if (fd >= prot_cap) {
+        int nc = fd + 16;
+        prot_fds = g_realloc(prot_fds, nc);
+        memset(prot_fds + prot_cap, 0, nc - prot_cap);
+        prot_cap = nc;
+    }
+    prot_fds[fd] = v;
+}
+
+bool kvm_user_is_internal_fd(int fd)
+{
+    return fd >= 0 && fd < prot_cap && prot_fds[fd];
+}
+
+/* Smallest internal fd >= from, or -1 (for close_range splitting). */
+int kvm_user_next_internal_fd(int from)
+{
+    for (int fd = from < 0 ? 0 : from; fd < prot_cap; fd++) {
+        if (prot_fds[fd]) {
+            return fd;
+        }
+    }
+    return -1;
+}
+
+/* Dump KVM's own per-vCPU counters (includes in-kernel exits not seen by the
+ * userspace run loop) via KVM_GET_STATS_FD -- no root needed. */
+static void kvm_dump_kvm_stats(int vcpu_fd)
+{
+    int sfd = ioctl(vcpu_fd, KVM_GET_STATS_FD, 0);
+    if (sfd < 0) {
+        return;
+    }
+    struct kvm_stats_header hdr;
+    if (pread(sfd, &hdr, sizeof(hdr), 0) != sizeof(hdr)) {
+        close(sfd);
+        return;
+    }
+    size_t dsz = sizeof(struct kvm_stats_desc) + hdr.name_size;
+    char *descs = g_malloc0(dsz * hdr.num_desc);
+    if (pread(sfd, descs, dsz * hdr.num_desc, hdr.desc_offset) > 0) {
+        for (unsigned i = 0; i < hdr.num_desc; i++) {
+            struct kvm_stats_desc *d = (struct kvm_stats_desc *)(descs + i * dsz);
+            uint64_t v = 0;
+            if (pread(sfd, &v, 8, hdr.data_offset + d->offset) == 8 && v) {
+                fprintf(stderr, "  kvmstat %-24s = %llu\n",
+                        d->name, (unsigned long long)v);
+            }
+        }
+    }
+    g_free(descs);
+    close(sfd);
+}
+
+/* Print a per-process VM-exit summary (QEMU_KVM_STATS=1); called at exit. */
+void kvm_user_dump_stats(void)
+{
+    if (!kvm_stats || st_total == 0) {
+        return;
+    }
+    uint64_t known = st_syscall + st_fault + st_exc + st_eintr;
+    st_other = st_total > known ? st_total - known : 0;
+    fprintf(stderr,
+        "[qemu-kvm-stats] pid %d exits=%llu  syscall=%llu  fault=%llu  "
+        "exc=%llu  eintr=%llu  other=%llu\n",
+        getpid(),
+        (unsigned long long)st_total, (unsigned long long)st_syscall,
+        (unsigned long long)st_fault, (unsigned long long)st_exc,
+        (unsigned long long)st_eintr, (unsigned long long)st_other);
+    if (current_cpu) {
+        kvm_dump_kvm_stats(current_cpu->kvm_fd);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -837,6 +929,7 @@ void kvm_user_init_vcpu(CPUState *cs)
         v->vcpu_id = next_vcpu_id++;
         cs->kvm_fd = kvm_ioctl(vm_fd, KVM_CREATE_VCPU,
                                (void *)(intptr_t)v->vcpu_id, "KVM_CREATE_VCPU");
+        kvm_mark_fd(cs->kvm_fd, true);
         int mmap_size = kvm_ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, (void *)0,
                                   "KVM_GET_VCPU_MMAP_SIZE");
         cs->kvm_run = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED,
@@ -947,6 +1040,9 @@ void kvm_user_fork_start(void)
 void kvm_user_fork_child(CPUState *cs)
 {
     /* Inherited fds refer to the parent's VM; drop this thread's and the VM's. */
+    kvm_mark_fd(cs->kvm_fd, false);
+    kvm_mark_fd(vm_fd, false);
+    kvm_mark_fd(kvm_fd, false);
     close(cs->kvm_fd);
     close(vm_fd);
     close(kvm_fd);
@@ -957,14 +1053,19 @@ void kvm_user_fork_child(CPUState *cs)
     /* Reset VM-global bookkeeping (other threads are gone in the child). */
     next_vcpu_id = 0;
     parked_list = NULL;
+    /* Inherited parked-vCPU fds are gone too; the chunk allocator state
+     * (chunk_map/gpa_owner) is COW-preserved and rebuilt from below. */
+    memset(prot_fds, 0, prot_cap);
 
     kvm_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (kvm_fd < 0) {
         perror("qemu-kvm: fork child open /dev/kvm");
         _exit(1);
     }
+    kvm_mark_fd(kvm_fd, true);
     vm_fd = kvm_ioctl(kvm_fd, KVM_CREATE_VM, (void *)0, "KVM_CREATE_VM");
     disable_slot_zap_quirk();
+    kvm_mark_fd(vm_fd, true);
 
     /*
      * The control region and the chunk allocator state are plain COW memory
@@ -989,6 +1090,7 @@ void kvm_user_fork_child(CPUState *cs)
 void kvm_user_setup(CPUState *cs)
 {
     kvm_debug = getenv("QEMU_KVM_DEBUG") != NULL;
+    kvm_stats = getenv("QEMU_KVM_STATS") != NULL;
 
     if (guest_base != 0) {
         fprintf(stderr, "qemu-kvm: requires identity mapping (guest_base==0), "
@@ -1001,7 +1103,9 @@ void kvm_user_setup(CPUState *cs)
         perror("qemu-kvm: open /dev/kvm");
         _exit(1);
     }
+    kvm_mark_fd(kvm_fd, true);
     vm_fd = kvm_ioctl(kvm_fd, KVM_CREATE_VM, (void *)0, "KVM_CREATE_VM");
+    kvm_mark_fd(vm_fd, true);
     DBG("vm created (fd=%d)\n", vm_fd);
     disable_slot_zap_quirk();
 
@@ -1021,6 +1125,15 @@ void kvm_user_setup(CPUState *cs)
 
     kvm_user_init_vcpu(cs);
     DBG("setup done\n");
+
+    /* Visible proof this process is executing inside the KVM VM.  Suppress with
+     * QEMU_KVM_QUIET=1. */
+    if (!getenv("QEMU_KVM_QUIET")) {
+        fprintf(stderr,
+            "\033[1;32m[qemu-kvm]\033[0m pid %d \342\226\266 running "
+            "\033[1m%s\033[0m natively at ring 0 in a KVM VM "
+            "(long mode, SIMD)\n", getpid(), exec_path);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1267,14 +1380,17 @@ int kvm_cpu_exec_user(CPUState *cs)
         int err = errno;
 
         sync_from_vcpu(cs, env);
+        st_total++;
         DBG("KVM_RUN exit r=%d errno=%d reason=%u rip=0x%llx\n",
             r, r < 0 ? err : 0, run->exit_reason, (unsigned long long)env->eip);
 
         if (r < 0) {
             if (err == EINTR || err == EAGAIN) {
+                st_eintr++;
                 return EXCP_INTERRUPT;
             }
             if (err == EFAULT) {
+                st_fault++;
                 /* GUP failure inside a memslot (PROT_NONE/hole/munmap'd): KVM
                  * gives no address, so decode the faulting instruction. */
                 uint64_t addr = decode_fault_addr(env);
@@ -1314,6 +1430,7 @@ int kvm_cpu_exec_user(CPUState *cs)
 
             if (port == SYSCALL_PORT) {
                 /* syscall: RCX = return addr, R11 = saved rflags. */
+                st_syscall++;
                 env->eip = env->regs[R_ECX];
                 env->eflags = env->regs[11];
                 return EXCP_SYSCALL;
@@ -1331,6 +1448,7 @@ int kvm_cpu_exec_user(CPUState *cs)
                 int vec = port;
                 struct ist_frame f;
                 uint64_t ec;
+                st_exc++;
                 read_ist_frame(env->regs[R_ESP], vector_has_errcode(vec), &f, &ec);
                 env->eip = f.rip;
                 env->regs[R_ESP] = f.rsp;
@@ -1405,6 +1523,7 @@ int kvm_cpu_exec_user(CPUState *cs)
              * with run->mmio data on the next KVM_RUN, clobbering any signal
              * delivery we attempt.  So: report and die.
              */
+            st_fault++;
             uint64_t gpa = run->mmio.phys_addr;
             uint64_t g = gpa >> CHUNK_BITS;
             uint32_t owner = (g >= 1 && g < pool_chunks)
@@ -1420,6 +1539,7 @@ int kvm_cpu_exec_user(CPUState *cs)
         }
 
         case KVM_EXIT_INTR:
+            st_eintr++;
             return EXCP_INTERRUPT;
 
         case KVM_EXIT_FAIL_ENTRY:
