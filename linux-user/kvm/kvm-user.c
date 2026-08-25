@@ -110,6 +110,7 @@ static uint64_t sc_hist[SC_HIST_N];   /* per-syscall-number exit histogram */
 #define SYSCALL_PORT 0x40
 
 /* MSRs */
+/* MSR_IA32_TSC (0x10) comes from target/i386/cpu.h. */
 #define MSR_EFER       0xc0000080
 #define MSR_STAR       0xc0000081
 #define MSR_LSTAR      0xc0000082
@@ -949,6 +950,13 @@ static void set_msr(CPUState *cs, uint32_t index, uint64_t data)
     kvm_ioctl(cs->kvm_fd, KVM_SET_MSRS, &m, "KVM_SET_MSRS");
 }
 
+static inline uint64_t host_rdtsc(void)
+{
+    uint32_t lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static void setup_msrs(CPUState *cs)
 {
     set_msr(cs, MSR_EFER, EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE);
@@ -956,6 +964,19 @@ static void setup_msrs(CPUState *cs)
             ((uint64_t)SEL_DATA << 48) | ((uint64_t)SEL_CODE << 32));
     set_msr(cs, MSR_LSTAR, NANO_VA_BASE + OFF_SYSCALL_STUB);
     set_msr(cs, MSR_SFMASK, 0x257fd5);   /* mask like the Linux kernel entry */
+
+    /*
+     * Zero the guest TSC offset: set the guest TSC to the current host TSC so
+     * the guest's rdtsc reads the same cycle counter the host's vvar timebase
+     * (cycle_last/mult) was sampled against.  Required for host-vDSO
+     * passthrough: __vdso_clock_gettime computes time = base + (rdtsc -
+     * cycle_last) * mult, so a nonzero offset would corrupt the result.  KVM
+     * otherwise defaults a fresh vCPU's TSC to 0 (offset = -host_tsc).  The
+     * residual skew is the VM-entry latency between this write and the guest's
+     * first rdtsc -- constant and sub-microsecond, harmless for a monotonic
+     * clock.
+     */
+    set_msr(cs, MSR_IA32_TSC, host_rdtsc());
 }
 
 static void setup_xcrs(CPUState *cs)
@@ -1259,6 +1280,66 @@ void kvm_user_fork_child(CPUState *cs)
     DBG("fork child rebuilt VM (vm_fd=%d)\n", vm_fd);
 }
 
+/*
+ * Host-vDSO passthrough.  QEMU's own guest vDSO (linux-user/x86_64/vdso.S) is a
+ * forwarding stub whose __vdso_clock_gettime is just `syscall`, so every guest
+ * clock_gettime -- millions per second in a JIT/GC workload -- becomes a VM
+ * exit.  Instead, map the *host* kernel's [vdso]+[vvar] pages into the guest at
+ * their own (identity) addresses and point the guest's AT_SYSINFO_EHDR at them
+ * (see create_elf_tables).  The guest then runs the real userspace timekeeping
+ * code -- rdtsc + the vvar seqlock data -- entirely at ring 0 with no exit.
+ * Prerequisites, both satisfied elsewhere: guest_base==0 (so host VA == guest
+ * VA, and the vDSO's RIP-relative reach to vvar is preserved), and guest TSC
+ * offset 0 (setup_msrs, so guest rdtsc matches the vvar timebase).  vvar is a
+ * special (PFNMAP) mapping; KVM maps it read-only into NPT via its remapped-pfn
+ * fault path, which is all the vDSO needs.
+ */
+static void map_host_vdso(void)
+{
+    if (getenv("QEMU_KVM_NO_HOST_VDSO")) {
+        DBG("host-vdso passthrough disabled (QEMU_KVM_NO_HOST_VDSO)\n");
+        return;
+    }
+
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) {
+        return;
+    }
+    uint64_t vvar_start = 0, vvar_end = 0, vdso_start = 0, vdso_end = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        uint64_t s, e;
+        char rest[256];
+        if (sscanf(line, "%" SCNx64 "-%" SCNx64 " %*s %*s %*s %*s %255[^\n]",
+                   &s, &e, rest) < 3) {
+            continue;
+        }
+        if (strstr(rest, "[vvar]")) {
+            vvar_start = s; vvar_end = e;
+        } else if (strstr(rest, "[vdso]")) {
+            vdso_start = s; vdso_end = e;
+        }
+    }
+    fclose(f);
+
+    /* Map both as one contiguous span (vvar sits directly below vdso). */
+    uint64_t lo = 0, hi = 0;
+    if (vvar_start) { lo = vvar_start; hi = vvar_end; }
+    if (vdso_start) {
+        lo = lo ? MIN(lo, vdso_start) : vdso_start;
+        hi = MAX(hi, vdso_end);
+    }
+    if (!lo || hi >= USER_VA_END) {
+        DBG("host-vdso passthrough unavailable (vvar/vdso not found or out of "
+            "range)\n");
+        return;
+    }
+    kvm_user_track_range(lo, hi - lo);
+    DBG("host-vdso mapped: vvar=[0x%llx,0x%llx) vdso=[0x%llx,0x%llx)\n",
+        (unsigned long long)vvar_start, (unsigned long long)vvar_end,
+        (unsigned long long)vdso_start, (unsigned long long)vdso_end);
+}
+
 void kvm_user_setup(CPUState *cs)
 {
     kvm_debug = getenv("QEMU_KVM_DEBUG") != NULL;
@@ -1292,6 +1373,10 @@ void kvm_user_setup(CPUState *cs)
     walk_memory_regions(NULL, mirror_region_cb);
     DBG("load-time mappings mapped (%u gpa chunks)\n", next_gpa_chunk - 1);
 
+    /* Map the host kernel's [vdso]+[vvar] so guest clock_gettime/gettimeofday
+     * run in-guest with no VM exit (see map_host_vdso + create_elf_tables). */
+    map_host_vdso();
+
     /* Route qemu_cpu_kick() to the KVM eviction path (start_exclusive). */
     qemu_cpu_kick_hook = kvm_user_kick;
 
@@ -1302,9 +1387,8 @@ void kvm_user_setup(CPUState *cs)
      * QEMU_KVM_QUIET=1. */
     if (!getenv("QEMU_KVM_QUIET")) {
         fprintf(stderr,
-            "\033[1;32m[qemu-kvm]\033[0m pid %d \342\226\266 running "
-            "\033[1m%s\033[0m natively at ring 0 in a KVM VM "
-            "(long mode, SIMD)\n", getpid(), exec_path);
+            "[qemu-kvm] pid %d: running "
+            "%s natively at ring 0 in a KVM VM\n", getpid(), exec_path);
     }
 }
 

@@ -13,6 +13,9 @@
 #include "exec/translation-block.h"
 #include "exec/tswap.h"
 #include "user-internals.h"
+#ifdef TARGET_X86_64
+#include "kvm/kvm-user.h"
+#endif
 #include "signal-common.h"
 #include "loader.h"
 #include "user-mmap.h"
@@ -723,6 +726,20 @@ static abi_ulong create_elf_tables(abi_ulong p, int argc, int envc,
         NEW_AUX_ENT(AT_PLATFORM, u_platform);
     }
     if (vdso_info) {
+#ifdef TARGET_X86_64
+        /*
+         * KVM host-vDSO passthrough: advertise the *host* kernel's vDSO (mapped
+         * into the guest by map_host_vdso()) rather than QEMU's forwarding-stub
+         * vDSO, so the guest resolves __vdso_clock_gettime etc. to real
+         * userspace timekeeping code and never traps out for the time.
+         * qemu_getauxval(AT_SYSINFO_EHDR) is this (host) process's own vDSO
+         * base; guest_base==0 makes that address valid in the guest too.
+         */
+        if (kvm_user_enabled && !getenv("QEMU_KVM_NO_HOST_VDSO")) {
+            NEW_AUX_ENT(AT_SYSINFO_EHDR,
+                        (abi_ulong)qemu_getauxval(AT_SYSINFO_EHDR));
+        } else
+#endif
         NEW_AUX_ENT(AT_SYSINFO_EHDR, vdso_info->load_addr);
     }
     NEW_AUX_ENT (AT_NULL, 0);
