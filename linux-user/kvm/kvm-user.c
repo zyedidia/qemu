@@ -61,6 +61,8 @@ static int kvm_debug;
 /* VM-exit accounting (QEMU_KVM_STATS=1 to print a per-process summary). */
 static int kvm_stats;
 static uint64_t st_syscall, st_fault, st_eintr, st_exc, st_other, st_total;
+#define SC_HIST_N 1024
+static uint64_t sc_hist[SC_HIST_N];   /* per-syscall-number exit histogram */
 
 /* ------------------------------------------------------------------ */
 /* Control region: guest page tables + nanokernel, in GPA chunk 0.     */
@@ -329,6 +331,38 @@ void kvm_user_dump_stats(void)
         (unsigned long long)st_total, (unsigned long long)st_syscall,
         (unsigned long long)st_fault, (unsigned long long)st_exc,
         (unsigned long long)st_eintr, (unsigned long long)st_other);
+
+    /* Top syscall numbers by VM-exit count (x86-64 NRs). */
+    static const struct { int nr; const char *name; } names[] = {
+        {0,"read"},{1,"write"},{3,"close"},{7,"poll"},{9,"mmap"},{10,"mprotect"},
+        {11,"munmap"},{12,"brk"},{13,"rt_sigaction"},{14,"rt_sigprocmask"},
+        {15,"rt_sigreturn"},{24,"sched_yield"},{25,"mremap"},{28,"madvise"},
+        {35,"nanosleep"},{39,"getpid"},{56,"clone"},{60,"exit"},{62,"kill"},
+        {96,"gettimeofday"},{98,"getrusage"},{131,"sigaltstack"},{158,"arch_prctl"},
+        {186,"gettid"},{200,"tkill"},{202,"futex"},{204,"sched_getaffinity"},
+        {218,"set_tid_address"},{228,"clock_gettime"},{230,"clock_nanosleep"},
+        {234,"tgkill"},{257,"openat"},{273,"set_robust_list"},{302,"prlimit64"},
+        {318,"getrandom"},{334,"rseq"},{435,"clone3"},{-1,NULL}
+    };
+    fprintf(stderr, "[qemu-kvm-stats] top syscall-exit NRs:\n");
+    for (int rank = 0; rank < 15; rank++) {
+        int best = -1;
+        uint64_t bestv = 0;
+        for (int i = 0; i < SC_HIST_N; i++) {
+            if (sc_hist[i] > bestv) { bestv = sc_hist[i]; best = i; }
+        }
+        if (best < 0 || bestv == 0) {
+            break;
+        }
+        const char *nm = "?";
+        for (int j = 0; names[j].nr >= 0; j++) {
+            if (names[j].nr == best) { nm = names[j].name; break; }
+        }
+        fprintf(stderr, "    nr=%-4d %-18s %llu\n", best, nm,
+                (unsigned long long)bestv);
+        sc_hist[best] = 0;   /* consume so next rank finds the next */
+    }
+
     if (current_cpu) {
         kvm_dump_kvm_stats(current_cpu->kvm_fd);
     }
@@ -1569,6 +1603,7 @@ int kvm_cpu_exec_user(CPUState *cs)
             if (port == SYSCALL_PORT) {
                 /* syscall: RCX = return addr, R11 = saved rflags. */
                 st_syscall++;
+                sc_hist[env->regs[R_EAX] & (SC_HIST_N - 1)]++;
                 env->eip = env->regs[R_ECX];
                 env->eflags = env->regs[11];
                 return EXCP_SYSCALL;
