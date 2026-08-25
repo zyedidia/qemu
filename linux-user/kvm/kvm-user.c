@@ -2,17 +2,25 @@
  * KVM-backed user-mode execution (x86-64 guest on x86-64 host).
  *
  * Instead of TCG-translating the guest, we run it natively inside a KVM VM at
- * ring 0 (long mode, CPL0).  The guest address space is identity-mapped:
- * guest-virtual == guest-physical == host-virtual (guest_base == 0).  KVM
- * memslots mirror linux-user's actual guest mappings, so a guest access to
- * mapped memory GUPs the identical host page (it just works), while an access to
- * a host-unmapped or PROT_NONE page inside a slot fails GUP and returns a bare
- * -EFAULT from KVM_RUN with the guest RIP left at the faulting instruction.
+ * ring 0 (long mode, CPL0).  Guest-virtual == host-virtual (guest_base == 0),
+ * so linux-user's host mappings back the guest's directly.  Guest-PHYSICAL
+ * space is separate and private to us: guest VA space is carved into 1 GiB
+ * chunks, and each chunk that contains a guest mapping owns a 1 GiB-aligned
+ * GPA chunk from a small pool, wired up by one KVM memslot (GPA chunk -> the
+ * chunk's host VA) plus one 1 GiB PDPTE in the guest page tables (guest VA ->
+ * GPA chunk).  A guest access to mapped memory thus GUPs the identical host
+ * page (it just works); an access to a host-unmapped or PROT_NONE page inside
+ * a live chunk fails GUP and returns a bare -EFAULT from KVM_RUN with the
+ * guest RIP left at the faulting instruction; an access to a VA with no chunk
+ * takes a guest #PF with an exact CR2.  When munmap/mremap/shmdt leaves a
+ * chunk with no guest mapping at all, its slot is deleted and its GPA chunk
+ * recycled (kvm_user_untrack_range).
  *
- * (Blanket slots covering the whole address space are NOT viable: KVM eagerly
- * allocates per-page rmap/lpage_info metadata proportional to slot size, so a
- * 128 TiB blanket would need terabytes of host RAM.  Mirroring keeps metadata
- * proportional to memory the guest actually uses.)
+ * (Identity GVA == GPA is NOT viable: usable guest-physical width is the
+ * host's MAXPHYADDR, commonly just 39 bits = 512 GiB, while host mmap
+ * scatters guest mappings across ~128 TiB of VA space.  Blanket slots are out
+ * for the same reason, and per-mapping translation also keeps KVM's per-slot
+ * metadata proportional to memory the guest actually uses.)
  *
  * A tiny host-generated ring-0 "nanokernel" (GDT/IDT/TSS + one-instruction
  * out-stubs) turns every syscall and CPU exception into a KVM_EXIT_IO: MSR_LSTAR
@@ -21,8 +29,8 @@
  * from the KVM_CAP_SYNC_REGS mmap page and, after handling, write the resume RIP
  * back the same way (the kernel's complete_fast_pio_out kvm_is_linear_rip guard
  * preserves our RIP).  The nanokernel + guest page tables live in one "control"
- * memslot at a high GPA, above the [0, 2^47) user range, so guest mappings can
- * never collide with them.
+ * memslot in GPA chunk 0, which is never handed to a guest chunk, so guest
+ * mappings can never collide with them.
  *
  * M1: single vCPU, mirror the mappings present at load time, syscall + basic
  * exception decode.  Dynamic mmap tracking, threads, fork, signals and precise
@@ -35,6 +43,7 @@
 #include "signal-common.h"
 #include "user/guest-base.h"
 #include "user/page-protection.h"
+#include "exec/mmap-lock.h"
 #include "kvm-user.h"
 
 #include <linux/kvm.h>
@@ -49,12 +58,21 @@ static int kvm_debug;
 #define DBG(...) do { if (kvm_debug) { fprintf(stderr, "qemu-kvm: " __VA_ARGS__); } } while (0)
 
 /* ------------------------------------------------------------------ */
-/* Control region: guest page tables + nanokernel, at a high GPA.      */
+/* Control region: guest page tables + nanokernel, in GPA chunk 0.     */
 /* ------------------------------------------------------------------ */
 
-#define CTRL_GPA     0x800000000000ULL     /* 2^47, above the user range     */
+#define CTRL_GPA     0x00000000ULL         /* GPA chunk 0, reserved for us   */
 #define CTRL_SIZE    0x00800000ULL         /* 8 MiB                          */
 #define PT_OFF       0x00000000ULL         /* page tables at ctrl + 0        */
+
+/* page-table page indices within the PT area (layout: setup_page_tables) */
+#define PT_PML4_PAGE   0
+#define PT_PDPT0_PAGE  1                   /* 256 user PDPTs: pages 1..256   */
+#define PT_PDPTK_PAGE  257                 /* kernel-half PDPT               */
+#define PT_PDK_PAGE    258                 /* kernel-half PD                 */
+#define PT_TOP_PD_PAGE 259                 /* top partial chunk: PD ...      */
+#define PT_TOP_PT_PAGE 260                 /*  ... and its last PT           */
+#define PT_PAGES       261
 #define NANO_OFF     0x00400000ULL         /* nanokernel at ctrl + 4 MiB     */
 #define NANO_GPA     (CTRL_GPA + NANO_OFF)
 #define NANO_SIZE    0x00200000ULL         /* one 2 MiB page                 */
@@ -112,17 +130,23 @@ static int kvm_debug;
 #define USER_VA_END  0x00007ffffffff000ULL
 
 /*
- * Memslots are created at 1 GiB "chunk" granularity, on demand, and never
- * removed.  A chunk slot is identity (userspace_addr == guest_phys_addr), so
- * whichever host pages are actually mapped within it just work, and holes
- * (unmapped / munmap'd / PROT_NONE) fail GUP -> -EFAULT.  This keeps per-page
- * KVM metadata proportional to the chunks the guest touches, and means
- * munmap/mprotect need no slot bookkeeping at all (the host mapping and its
- * protection are the source of truth via GUP).
+ * GVA -> GPA translation is at 1 GiB "chunk" granularity, on demand.  A GVA
+ * chunk that contains a guest mapping owns a 1 GiB-aligned GPA chunk from a
+ * pool sized by the host's usable guest-physical width (39-bit MAXPHYADDR =
+ * 512 chunks), wired up by one memslot (slot id == GPA chunk index;
+ * userspace_addr == the chunk's GVA) and one 1 GiB PDPTE.  Within a live
+ * chunk the host mapping and its protection remain the source of truth via
+ * GUP: holes (unmapped / munmap'd / PROT_NONE) fail GUP -> -EFAULT, so
+ * mprotect and partial munmap need no bookkeeping here at all.  Only when a
+ * whole chunk no longer contains any guest mapping is it torn down and its
+ * GPA chunk recycled (kvm_user_untrack_range), so KVM per-slot metadata and
+ * GPA space both stay proportional to memory the guest actually uses.
  */
 #define CHUNK_BITS  30
 #define CHUNK_SIZE  (1ULL << CHUNK_BITS)
-#define NUM_CHUNKS  (USER_VA_END >> CHUNK_BITS)
+#define NUM_CHUNKS  ((USER_VA_END + CHUNK_SIZE - 1) >> CHUNK_BITS)
+
+#define GPA_FREE    UINT32_MAX
 
 /* ------------------------------------------------------------------ */
 /* Global VM state (M1: one VM, one vCPU)                             */
@@ -133,8 +157,19 @@ static int vm_fd = -1;
 static uint8_t *ctrl;                 /* host mapping of the control region */
 static uint8_t *nano;                 /* = ctrl + NANO_OFF                  */
 static uint64_t cr3_gpa;              /* guest-physical of PML4             */
-static uint32_t next_slot;
-static uint8_t *chunk_present;        /* bitmap: which 1GiB chunks have slots */
+
+/*
+ * GVA<->GPA chunk state.  All mutation happens under mmap_lock (taken inside
+ * kvm_user_track_range/kvm_user_untrack_range; setup and fork are
+ * single-threaded); gpa_owner is additionally read locklessly on the
+ * KVM_EXIT_MMIO path, hence the qatomic accessors there.
+ */
+static uint32_t *chunk_map;           /* GVA chunk -> its GPA chunk (0 = none) */
+static uint32_t *gpa_owner;           /* GPA chunk -> GVA chunk, or GPA_FREE   */
+static uint32_t *gpa_free_stack;      /* recycled GPA chunks (LIFO)            */
+static uint32_t n_gpa_free;
+static uint32_t next_gpa_chunk;       /* bump allocator; chunk 0 is control    */
+static uint32_t pool_chunks;          /* GPA chunks usable: [1, pool_chunks)   */
 
 /* Per-vCPU (per guest thread) state, hung off CPUState::accel. */
 typedef struct KVMUserVCPU {
@@ -171,7 +206,7 @@ static int kvm_ioctl(int fd, int req, void *arg, const char *what)
 }
 
 /* ------------------------------------------------------------------ */
-/* Memory: control slot + per-mapping mirror slots                    */
+/* Memory: GVA<->GPA chunk translation + slot bookkeeping             */
 /* ------------------------------------------------------------------ */
 
 static void add_memslot(uint32_t slot, uint64_t gpa, uint64_t hva, uint64_t size)
@@ -187,50 +222,225 @@ static void add_memslot(uint32_t slot, uint64_t gpa, uint64_t hva, uint64_t size
               "KVM_SET_USER_MEMORY_REGION");
 }
 
-/* Ensure a memslot exists for the 1GiB chunk containing gpa. */
-static void ensure_chunk(uint64_t gpa)
+static void del_memslot(uint32_t slot)
 {
-    uint64_t c = gpa >> CHUNK_BITS;
+    struct kvm_userspace_memory_region region = { .slot = slot };
+
+    kvm_ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region,
+              "KVM_SET_USER_MEMORY_REGION (delete)");
+}
+
+/*
+ * Usable guest-physical space is bounded by the host's MAXPHYADDR, possibly
+ * reduced (e.g. by AMD memory encryption) -- commonly just 39 bits (512 GiB).
+ * Ask KVM itself: find the highest power-of-two limit under which it accepts
+ * a one-page memslot.
+ */
+static uint64_t probe_gpa_limit(void)
+{
+    void *page = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        perror("qemu-kvm: mmap gpa probe page");
+        _exit(1);
+    }
+    for (int bits = 52; bits > CHUNK_BITS; bits--) {
+        struct kvm_userspace_memory_region region = {
+            .slot = 0,
+            .guest_phys_addr = (1ULL << bits) - 0x1000,
+            .memory_size = 0x1000,
+            .userspace_addr = (uint64_t)(uintptr_t)page,
+        };
+        if (ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region) == 0) {
+            region.memory_size = 0;
+            kvm_ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region,
+                      "KVM_SET_USER_MEMORY_REGION (delete)");
+            munmap(page, 0x1000);
+            DBG("gpa limit: 2^%d\n", bits);
+            return 1ULL << bits;
+        }
+    }
+    fprintf(stderr, "qemu-kvm: could not size guest-physical space\n");
+    _exit(1);
+}
+
+/* PDPTE slot for a user GVA chunk (layout fixed by setup_page_tables). */
+static uint64_t *user_pdpte(uint64_t gva_chunk)
+{
+    uint64_t *pdpt =
+        (uint64_t *)(ctrl + PT_OFF + (1 + (gva_chunk >> 9)) * 4096);
+    return &pdpt[gva_chunk & 511];
+}
+
+/* Memslot span of a GVA chunk (the top chunk stops at USER_VA_END). */
+static uint64_t chunk_span(uint64_t gva_chunk)
+{
+    return MIN(CHUNK_SIZE, USER_VA_END - (gva_chunk << CHUNK_BITS));
+}
+
+static uint32_t alloc_gpa_chunk(void)
+{
+    if (n_gpa_free > 0) {
+        return gpa_free_stack[--n_gpa_free];
+    }
+    if (next_gpa_chunk < pool_chunks) {
+        return next_gpa_chunk++;
+    }
+    /*
+     * Out of guest-physical space: pool_chunks-1 distinct GVA chunks hold
+     * live mappings simultaneously.  Leave this chunk untranslated; a guest
+     * access to it will take #PF -> SIGSEGV.
+     */
+    static bool warned;
+    if (!warned) {
+        warned = true;
+        fprintf(stderr, "qemu-kvm: out of guest-physical space (%u 1 GiB "
+                "chunks in simultaneous use); guest accesses to further "
+                "mappings will fault\n", pool_chunks - 1);
+    }
+    return 0;
+}
+
+/*
+ * Install the guest translation for chunk c -> GPA chunk g.  A full chunk is
+ * a single 1 GiB PDPTE.  The one partial chunk at the top of the user range
+ * instead gets an exact 2 MiB + 4 KiB tree stopping at USER_VA_END: a 1 GiB
+ * PDPTE would let accesses in [USER_VA_END, 2^47) reach GPAs beyond the
+ * chunk's memslot, and a no-slot GPA access puts the vCPU into KVM's
+ * in-kernel MMIO emulation, from which no clean #PF can be delivered (see
+ * KVM_EXIT_MMIO in the run loop).  With exact tables those accesses take a
+ * guest #PF like any other unmapped VA.
+ */
+static void install_chunk_pte(uint64_t c, uint32_t g)
+{
+    uint64_t gpa = (uint64_t)g << CHUNK_BITS;
+    uint64_t span = chunk_span(c);
+
+    if (span == CHUNK_SIZE) {
+        *user_pdpte(c) = gpa | PTE_P | PTE_RW | PTE_PS;
+        return;
+    }
+    /* Only the single top chunk is partial, so one static PD/PT pair does. */
+    uint64_t *pd = (uint64_t *)(ctrl + PT_OFF + PT_TOP_PD_PAGE * 4096);
+    uint64_t *pt = (uint64_t *)(ctrl + PT_OFF + PT_TOP_PT_PAGE * 4096);
+    for (uint64_t j = 0; j < 512; j++) {
+        uint64_t off = j << 21;
+        if (off + (1ULL << 21) <= span) {
+            pd[j] = (gpa + off) | PTE_P | PTE_RW | PTE_PS;
+        } else {
+            pd[j] = (CTRL_GPA + PT_OFF + PT_TOP_PT_PAGE * 4096) |
+                    PTE_P | PTE_RW;
+            for (uint64_t k = 0; k < 512; k++) {
+                uint64_t poff = off + (k << 12);
+                pt[k] = poff < span ? (gpa + poff) | PTE_P | PTE_RW : 0;
+            }
+        }
+    }
+    *user_pdpte(c) = (CTRL_GPA + PT_OFF + PT_TOP_PD_PAGE * 4096) |
+                     PTE_P | PTE_RW;
+}
+
+/* Give the 1 GiB GVA chunk containing va a GPA chunk, memslot and PTEs. */
+static void ensure_chunk(uint64_t va)
+{
+    uint64_t c = va >> CHUNK_BITS;
 
     if (c >= NUM_CHUNKS) {
         return;                                 /* kernel-half / vsyscall etc. */
     }
-    if (chunk_present[c >> 3] & (1u << (c & 7))) {
+    if (chunk_map[c]) {
         return;
     }
-    chunk_present[c >> 3] |= (1u << (c & 7));
+    uint32_t g = alloc_gpa_chunk();
+    if (!g) {
+        return;
+    }
+    chunk_map[c] = g;
+    qatomic_set(&gpa_owner[g], (uint32_t)c);
+    /*
+     * Slot before PTEs: a concurrent vCPU's page walk must never find a
+     * translation to a slotless GPA (that would surface as spurious MMIO).
+     * Not-present entries are never cached, so the install itself needs no
+     * TLB invalidation.
+     */
+    add_memslot(g, (uint64_t)g << CHUNK_BITS, c << CHUNK_BITS, chunk_span(c));
+    install_chunk_pte(c, g);
+    DBG("  chunk va=0x%llx -> gpa chunk %u (+0x%llx)\n",
+        (unsigned long long)(c << CHUNK_BITS), g,
+        (unsigned long long)chunk_span(c));
+}
 
-    uint64_t base = c << CHUNK_BITS;
-    uint64_t size = MIN(CHUNK_SIZE, USER_VA_END - base);
-    add_memslot(next_slot++, base, base, size);
-    DBG("  chunk slot %u: [0x%llx, +0x%llx)\n", next_slot - 1,
-        (unsigned long long)base, (unsigned long long)size);
+/* Tear down an empty chunk's translation and recycle its GPA chunk. */
+static void free_chunk(uint64_t c)
+{
+    uint32_t g = chunk_map[c];
+
+    /*
+     * PDPTE first, so a page walk after the flush below faults instead of
+     * re-creating a translation; then the slot DELETE, which zaps the chunk's
+     * EPT entries and flushes every vCPU's TLB (evicting any stale
+     * GVA->GPA->HVA translation) before returning.  Only after that may the
+     * GPA chunk be handed to a different GVA chunk.
+     */
+    *user_pdpte(c) = 0;
+    del_memslot(g);
+    chunk_map[c] = 0;
+    qatomic_set(&gpa_owner[g], GPA_FREE);
+    gpa_free_stack[n_gpa_free++] = g;
+    DBG("  chunk va=0x%llx freed (gpa chunk %u recycled)\n",
+        (unsigned long long)(c << CHUNK_BITS), g);
 }
 
 /*
- * Ensure memslots cover [start, start+len).  Called from the mmap layer for
- * every new/moved guest mapping, and at setup for the load-time mappings.
- * No-op until the VM exists (early target_mmap during ELF load is covered by
- * the setup-time walk below).
+ * Ensure chunk translations cover [start, start+len).  Called from the mmap
+ * layer for every new/moved readable guest mapping, and at setup for the
+ * load-time mappings.  No-op until the VM exists (early target_mmap during
+ * ELF load is covered by the setup-time walk).
  */
 void kvm_user_track_range(uint64_t start, uint64_t len)
 {
     if (!kvm_user_enabled || vm_fd < 0 || len == 0) {
         return;
     }
+    mmap_lock();                   /* serializes all chunk/PDPTE bookkeeping */
     uint64_t end = start + len;
     for (uint64_t g = start & ~(CHUNK_SIZE - 1); g < end; g += CHUNK_SIZE) {
         ensure_chunk(g);
     }
+    mmap_unlock();
+}
+
+/*
+ * Recycle any chunk in [start, start+len) that no longer contains any guest
+ * mapping.  Called from the mmap layer after munmap/mremap/shmdt cleared the
+ * range's page flags; the emptiness test and the teardown run under mmap_lock
+ * so they are atomic against concurrent mmap.
+ */
+void kvm_user_untrack_range(uint64_t start, uint64_t len)
+{
+    if (!kvm_user_enabled || vm_fd < 0 || len == 0) {
+        return;
+    }
+    mmap_lock();
+    uint64_t last_c = MIN((start + len - 1) >> CHUNK_BITS,
+                          (uint64_t)NUM_CHUNKS - 1);
+    for (uint64_t c = start >> CHUNK_BITS; c <= last_c; c++) {
+        if (chunk_map[c] &&
+            page_check_range_empty(c << CHUNK_BITS,
+                                   (c << CHUNK_BITS) + chunk_span(c) - 1)) {
+            free_chunk(c);
+        }
+    }
+    mmap_unlock();
 }
 
 static int mirror_region_cb(void *priv, vaddr start, vaddr end, int flags)
 {
     /*
-     * Only slot readable memory.  PROT_NONE reservations (which can span many
-     * TiB, e.g. a PIE/ld.so address-space reservation) get no slot: a guest
-     * access to them correctly faults (KVM_EXIT_MMIO -> SIGSEGV), and when the
-     * guest later mprotect()s a sub-range readable, the mprotect hook slots it.
+     * Only readable memory gets a chunk.  PROT_NONE reservations (which can
+     * span many TiB, e.g. a PIE/ld.so address-space reservation) get none: a
+     * guest access to them correctly faults (#PF -> SIGSEGV), and when the
+     * guest later mprotect()s a sub-range readable, the mprotect hook maps it.
      */
     if (!(flags & PAGE_READ)) {
         DBG("  skip non-readable [0x%llx, 0x%llx) flags=0x%x\n",
@@ -243,7 +453,31 @@ static int mirror_region_cb(void *priv, vaddr start, vaddr end, int flags)
 
 static void setup_memory(void)
 {
-    /* Control region (page tables + nanokernel) at its high GPA. */
+    /* Size the GPA chunk pool: chunk 0 is the control region, the rest are
+     * handed out to GVA chunks (each also needs a memslot of its own). */
+    uint64_t gpa_limit = probe_gpa_limit();
+    int nr_slots = ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_NR_MEMSLOTS);
+    if (nr_slots <= 0) {
+        nr_slots = 32;                          /* KVM's historical default */
+    }
+    pool_chunks = MIN(gpa_limit >> CHUNK_BITS, (uint64_t)nr_slots);
+    if (pool_chunks < 4) {
+        fprintf(stderr, "qemu-kvm: guest-physical space too small (%u GiB)\n",
+                pool_chunks);
+        _exit(1);
+    }
+    DBG("gpa pool: %u usable 1 GiB chunks\n", pool_chunks - 1);
+
+    chunk_map = g_malloc0(NUM_CHUNKS * sizeof(*chunk_map));
+    gpa_owner = g_new(uint32_t, pool_chunks);
+    for (uint32_t i = 0; i < pool_chunks; i++) {
+        gpa_owner[i] = GPA_FREE;
+    }
+    gpa_free_stack = g_new(uint32_t, pool_chunks);
+    n_gpa_free = 0;
+    next_gpa_chunk = 1;
+
+    /* Control region (page tables + nanokernel) in GPA chunk 0. */
     ctrl = mmap(NULL, CTRL_SIZE, PROT_READ | PROT_WRITE,
                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ctrl == MAP_FAILED) {
@@ -251,50 +485,43 @@ static void setup_memory(void)
         _exit(1);
     }
     nano = ctrl + NANO_OFF;
-    add_memslot(next_slot++, CTRL_GPA, (uint64_t)(uintptr_t)ctrl, CTRL_SIZE);
-
-    chunk_present = g_malloc0((NUM_CHUNKS + 7) / 8);
-
-    /* Mirror the guest mappings that exist at load time. */
-    walk_memory_regions(NULL, mirror_region_cb);
+    add_memslot(0, CTRL_GPA, (uint64_t)(uintptr_t)ctrl, CTRL_SIZE);
 }
 
 /* ------------------------------------------------------------------ */
-/* Static identity guest page tables (in the control region)          */
+/* Guest page tables (in the control region)                          */
 /* ------------------------------------------------------------------ */
 
 static void setup_page_tables(void)
 {
     /*
-     * PML4[0..255] -> 256 PDPTs of 512 * 1GiB identity pages, covering all of
-     * [0, 2^47).  PML4[511] -> a chain mapping the nanokernel's kernel-half VA
-     * to NANO_GPA.  Tables live in the control region; a table page at control
-     * offset O has guest-physical address CTRL_GPA + O.
+     * PML4[0..255] -> 256 initially-empty PDPTs covering user VAs [0, 2^47);
+     * their 1 GiB PDPTEs are demand-installed by ensure_chunk() to point at
+     * allocated GPA chunks (and cleared again by free_chunk()).  PML4[511] ->
+     * a chain mapping the nanokernel's kernel-half VA to NANO_GPA.  Tables
+     * live in the control region; a table page at control offset O has
+     * guest-physical address CTRL_GPA + O.
      */
     const int NUSER = 256;
     uint8_t *base = ctrl + PT_OFF;
-    memset(base, 0, (2 + NUSER + 1) * 4096);
+    memset(base, 0, PT_PAGES * 4096);
 
-    uint64_t *pml4  = (uint64_t *)(base + 0);
-    uint64_t *pdptk = (uint64_t *)(base + (1 + NUSER) * 4096);
-    uint64_t *pdk   = (uint64_t *)(base + (2 + NUSER) * 4096);
+    uint64_t *pml4  = (uint64_t *)(base + PT_PML4_PAGE * 4096);
+    uint64_t *pdptk = (uint64_t *)(base + PT_PDPTK_PAGE * 4096);
+    uint64_t *pdk   = (uint64_t *)(base + PT_PDK_PAGE * 4096);
     uint64_t gpa_base = CTRL_GPA + PT_OFF;
 
     for (int i = 0; i < NUSER; i++) {
-        uint64_t *pdpt = (uint64_t *)(base + (1 + i) * 4096);
-        pml4[i] = (gpa_base + (uint64_t)(1 + i) * 4096) | PTE_P | PTE_RW;
-        for (int j = 0; j < 512; j++) {
-            uint64_t va = ((uint64_t)i * 512 + j) << 30;   /* 1GiB stride */
-            pdpt[j] = va | PTE_P | PTE_RW | PTE_PS;
-        }
+        pml4[i] = (gpa_base + (uint64_t)(PT_PDPT0_PAGE + i) * 4096) |
+                  PTE_P | PTE_RW;
     }
 
     /* Kernel-half chain for the nanokernel VA: PML4[511]->PDPTk[510]->PDk[0]. */
-    pml4[511]  = (gpa_base + (uint64_t)(1 + NUSER) * 4096) | PTE_P | PTE_RW;
-    pdptk[510] = (gpa_base + (uint64_t)(2 + NUSER) * 4096) | PTE_P | PTE_RW;
+    pml4[511]  = (gpa_base + (uint64_t)PT_PDPTK_PAGE * 4096) | PTE_P | PTE_RW;
+    pdptk[510] = (gpa_base + (uint64_t)PT_PDK_PAGE * 4096) | PTE_P | PTE_RW;
     pdk[0]     = NANO_GPA | PTE_P | PTE_RW | PTE_PS;         /* 2MiB page */
 
-    cr3_gpa = gpa_base;   /* PML4 is at control offset 0 */
+    cr3_gpa = gpa_base + PT_PML4_PAGE * 4096;
 }
 
 /* ------------------------------------------------------------------ */
@@ -698,10 +925,8 @@ void kvm_user_fork_child(CPUState *cs)
     cs->kvm_run = NULL;
 
     /* Reset VM-global bookkeeping (other threads are gone in the child). */
-    next_slot = 0;
     next_vcpu_id = 0;
     parked_list = NULL;
-    memset(chunk_present, 0, (NUM_CHUNKS + 7) / 8);
 
     kvm_fd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (kvm_fd < 0) {
@@ -710,10 +935,20 @@ void kvm_user_fork_child(CPUState *cs)
     }
     vm_fd = kvm_ioctl(kvm_fd, KVM_CREATE_VM, (void *)0, "KVM_CREATE_VM");
 
-    /* Control region content is COW-preserved; just re-slot it and the guest
-     * mappings (page tables / nanokernel need no rebuild). */
-    add_memslot(next_slot++, CTRL_GPA, (uint64_t)(uintptr_t)ctrl, CTRL_SIZE);
-    walk_memory_regions(NULL, mirror_region_cb);
+    /*
+     * The control region and the chunk allocator state are plain COW memory
+     * and survive fork intact, and the inherited guest page tables encode the
+     * parent's GVA -> GPA chunk assignment.  Rebuild the slots from
+     * chunk_map[] verbatim -- NOT by re-walking the mappings, which could
+     * assign GPA chunks differently from what the PDPTEs say.
+     */
+    add_memslot(0, CTRL_GPA, (uint64_t)(uintptr_t)ctrl, CTRL_SIZE);
+    for (uint64_t c = 0; c < NUM_CHUNKS; c++) {
+        if (chunk_map[c]) {
+            add_memslot(chunk_map[c], (uint64_t)chunk_map[c] << CHUNK_BITS,
+                        c << CHUNK_BITS, chunk_span(c));
+        }
+    }
 
     kvm_user_init_vcpu(cs);
     kvm_user_put_fpu(cs);          /* restore the inherited FP snapshot */
@@ -739,11 +974,15 @@ void kvm_user_setup(CPUState *cs)
     DBG("vm created (fd=%d)\n", vm_fd);
 
     setup_memory();
-    DBG("memory slots done (%u slots)\n", next_slot);
     setup_page_tables();
     DBG("page tables done (cr3=0x%llx)\n", (unsigned long long)cr3_gpa);
     setup_nanokernel();
     DBG("nanokernel done\n");
+
+    /* Map the guest mappings that exist at load time.  Must follow
+     * setup_page_tables(): the walk installs PDPTEs. */
+    walk_memory_regions(NULL, mirror_region_cb);
+    DBG("load-time mappings mapped (%u gpa chunks)\n", next_gpa_chunk - 1);
 
     /* Route qemu_cpu_kick() to the KVM eviction path (start_exclusive). */
     qemu_cpu_kick_hook = kvm_user_kick;
@@ -899,6 +1138,26 @@ static uint32_t fault_error_code(uint64_t addr, bool is_write)
     return ec;
 }
 
+/*
+ * True if the guest page flags now permit the access that just faulted (only
+ * ec's W and I/D bits are consulted).  A fault on a page that is valid by
+ * handling time raced another thread's mmap/mprotect -- chunk slots and
+ * PDPTEs trail the page-flag update -- so, like the kernel on a spurious
+ * fault, the access should be retried rather than raised as a signal.
+ */
+static bool fault_resolved(uint64_t addr, uint32_t ec)
+{
+    int flags = page_get_flags(addr);
+
+    if (ec & PG_ERROR_I_D_MASK) {
+        return flags & PAGE_EXEC;
+    }
+    if (ec & PG_ERROR_W_MASK) {
+        return (flags & PAGE_READ) && (flags & PAGE_WRITE);
+    }
+    return flags & PAGE_READ;
+}
+
 /* ------------------------------------------------------------------ */
 /* Run loop                                                           */
 /* ------------------------------------------------------------------ */
@@ -951,6 +1210,8 @@ int kvm_cpu_exec_user(CPUState *cs)
 {
     CPUX86State *env = cpu_env(cs);
     struct kvm_run *run = cs->kvm_run;
+    uint64_t retry_addr = 0;
+    int retry_count = 0;
 
     current_cpu = cs;
 
@@ -985,6 +1246,21 @@ int kvm_cpu_exec_user(CPUState *cs)
                 /* GUP failure inside a memslot (PROT_NONE/hole/munmap'd): KVM
                  * gives no address, so decode the faulting instruction. */
                 uint64_t addr = decode_fault_addr(env);
+                /*
+                 * Spurious (raced a concurrent mmap/mprotect): retry.  The
+                 * access direction is unknown here, so demand write
+                 * permission too; the cap guards against a page GUP
+                 * persistently refuses (e.g. OOM).
+                 */
+                if (fault_resolved(addr, PG_ERROR_W_MASK)) {
+                    if (addr != retry_addr) {
+                        retry_addr = addr;
+                        retry_count = 0;
+                    }
+                    if (retry_count++ < 64) {
+                        continue;
+                    }
+                }
                 env->cr[2] = addr;
                 env->error_code = fault_error_code(addr, false);
                 return EXCP0E_PAGE;
@@ -1040,14 +1316,25 @@ int kvm_cpu_exec_user(CPUState *cs)
                 case 13: return EXCP0D_GPF;
                 case 14: {
                     /*
-                     * Guest #PF.  With static all-present identity user PTs this
-                     * only fires for kernel-half VAs the guest can't map -- in
-                     * practice the legacy vsyscall page.  CR2 holds the address.
+                     * Guest #PF, CR2 exact.  Fires for the legacy vsyscall
+                     * page, for other kernel-half VAs, and for any user VA
+                     * whose chunk has no translation: unmapped memory, or a
+                     * mapping whose PDPTE was racing in (then the retry
+                     * below resumes it).
                      */
                     uint64_t cr2 = read_cr2(cs);
                     if ((cr2 & ~0xfffULL) == VSYSCALL_PAGE) {
                         env->eip = cr2;          /* emulate_vsyscall reads offset */
                         return EXCP_VSYSCALL;
+                    }
+                    if (fault_resolved(cr2, ec)) {
+                        if (cr2 != retry_addr) {
+                            retry_addr = cr2;
+                            retry_count = 0;
+                        }
+                        if (retry_count++ < 64) {
+                            continue;
+                        }
                     }
                     env->cr[2] = cr2;
                     return EXCP0E_PAGE;
@@ -1074,13 +1361,31 @@ int kvm_cpu_exec_user(CPUState *cs)
             force_sig(TARGET_SIGSEGV);
             return EXCP_INTERRUPT;
 
-        case KVM_EXIT_MMIO:
-            /* Access to a GPA with no memslot (unmapped guest address).  The
-             * faulting GPA is exact; derive the error code from page flags. */
-            env->cr[2] = run->mmio.phys_addr;
-            env->error_code = fault_error_code(run->mmio.phys_addr,
-                                               run->mmio.is_write);
-            return EXCP0E_PAGE;
+        case KVM_EXIT_MMIO: {
+            /*
+             * EPT access to a GPA with no memslot.  Cannot legitimately
+             * happen: every GPA a guest page-table walk can produce lies
+             * within a live memslot (full chunks by construction; the top
+             * partial chunk via exact sub-tables), and chunk teardown clears
+             * the PTEs and flushes every vCPU's TLB before the slot dies.
+             * Nor is recovery possible: KVM's in-kernel emulator has already
+             * advanced past the instruction and will complete the access
+             * with run->mmio data on the next KVM_RUN, clobbering any signal
+             * delivery we attempt.  So: report and die.
+             */
+            uint64_t gpa = run->mmio.phys_addr;
+            uint64_t g = gpa >> CHUNK_BITS;
+            uint32_t owner = (g >= 1 && g < pool_chunks)
+                             ? qatomic_read(&gpa_owner[g]) : GPA_FREE;
+            fprintf(stderr, "qemu-kvm: unexpected MMIO exit: %s gpa=0x%llx "
+                    "(gpa chunk %llu: %s va chunk 0x%llx) size=%u rip=0x%llx\n",
+                    run->mmio.is_write ? "write" : "read",
+                    (unsigned long long)gpa, (unsigned long long)g,
+                    owner == GPA_FREE ? "unowned; nominal" : "owned by",
+                    (unsigned long long)(owner == GPA_FREE ? 0 : owner),
+                    run->mmio.len, (unsigned long long)env->eip);
+            _exit(1);
+        }
 
         case KVM_EXIT_INTR:
             return EXCP_INTERRUPT;

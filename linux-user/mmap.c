@@ -1120,6 +1120,13 @@ int target_munmap(abi_ulong start, abi_ulong len)
     }
     mmap_unlock();
 
+#ifdef TARGET_X86_64
+    /* Chunks in the unmapped range that are now empty can drop their KVM
+     * slots and recycle their guest-physical space. */
+    if (ret == 0 && kvm_user_enabled) {
+        kvm_user_untrack_range(start, len);
+    }
+#endif
     return ret;
 }
 
@@ -1186,6 +1193,11 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
                        prot | PAGE_VALID, PAGE_VALID);
         shm_region_rm_complete(new_addr, new_addr + new_size - 1);
         mmap_unlock();
+#ifdef TARGET_X86_64
+        if (kvm_user_enabled) {
+            kvm_user_track_range(new_addr, new_size);
+        }
+#endif
         return new_addr;
     }
 
@@ -1271,6 +1283,8 @@ abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
     mmap_unlock();
 #ifdef TARGET_X86_64
     if (new_addr != -1 && kvm_user_enabled) {
+        /* A move or shrink may have emptied chunks of the old range. */
+        kvm_user_untrack_range(old_addr, old_size);
         kvm_user_track_range(new_addr, new_size);
     }
 #endif
@@ -1563,6 +1577,13 @@ abi_ulong target_shmat(CPUArchState *cpu_env, int shmid,
         shm_region_add(shmaddr, last);
     }
 
+#ifdef TARGET_X86_64
+    /* shmat mappings are readable; make sure the guest can reach them. */
+    if (kvm_user_enabled) {
+        kvm_user_track_range(shmaddr, m_len);
+    }
+#endif
+
     /*
      * We're mapping shared memory, so ensure we generate code for parallel
      * execution and flush old translations.  This will work up to the level
@@ -1601,6 +1622,11 @@ abi_long target_shmdt(abi_ulong shmaddr)
             page_set_flags(shmaddr, last, 0, PAGE_VALID);
             shm_region_rm_complete(shmaddr, last);
             mmap_reserve_or_unmap(shmaddr, size);
+#ifdef TARGET_X86_64
+            if (kvm_user_enabled) {
+                kvm_user_untrack_range(shmaddr, size);
+            }
+#endif
         }
     }
     return rv;

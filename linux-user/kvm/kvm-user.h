@@ -32,11 +32,20 @@ void kvm_user_setup(CPUState *cs);
 int kvm_cpu_exec_user(CPUState *cs);
 
 /*
- * Ensure KVM memslots cover [start, start+len).  Called from the mmap layer
- * whenever a new/moved guest mapping appears.  No-op unless KVM mode is active
- * and the VM has been created.
+ * Ensure KVM chunk translations (memslot + guest PDPTE) cover
+ * [start, start+len).  Called from the mmap layer whenever a new/moved guest
+ * mapping appears.  No-op unless KVM mode is active and the VM has been
+ * created.
  */
 void kvm_user_track_range(uint64_t start, uint64_t len);
+
+/*
+ * Tear down and recycle the translation of any 1 GiB chunk in
+ * [start, start+len) that no longer contains any guest mapping.  Called from
+ * the mmap layer after munmap/mremap/shmdt have cleared the range's page
+ * flags.  No-op unless KVM mode is active and the VM has been created.
+ */
+void kvm_user_untrack_range(uint64_t start, uint64_t len);
 
 /*
  * Sync FP/SIMD state between the vCPU and env, called by the signal-frame code:
