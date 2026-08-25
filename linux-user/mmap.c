@@ -264,8 +264,29 @@ int target_mprotect(abi_ulong start, abi_ulong len, int target_prot)
     }
 
     for (int i = 0; i < nranges; ++i) {
-        ret = mprotect(g2h_untagged(starts[i]), lens[i],
-                       target_to_host_prot(prots[i]));
+        int host_prot = target_to_host_prot(prots[i]);
+#ifdef TARGET_X86_64
+        /*
+         * KVM relaxed mprotect (opt-in via QEMU_KVM_RELAX_MPROTECT).  SpiderMonkey
+         * flips hot pages RW<->R ~90k times/run to keep structures read-only
+         * between writes; each host mprotect that toggles the write bit fires an
+         * MMU notifier that zaps the page's NPT entry, so the guest refaults it on
+         * next access -- the dominant remaining VM-exit source.  Our NPT is RWX
+         * for every readable page anyway (GUP can't enforce W^X), so honoring the
+         * guest's write-protect downgrade buys nothing it can observe.  Pin any
+         * still-readable page to host RW: the repeated flips collapse to
+         * mprotect(RW->RW), which the kernel short-circuits (newflags==oldflags)
+         * without an invalidate, so the NPT entry survives.  PROT_NONE is still
+         * honored (guard pages / decommit still fault).  Tradeoff: a stray guest
+         * write to a page it marked read-only no longer faults -- acceptable for
+         * the research fork (the VM, not intra-guest RELRO/W^X, is the sandbox).
+         */
+        if (kvm_user_enabled && kvm_user_relax_mprotect &&
+            (host_prot & PROT_READ)) {
+            host_prot |= PROT_WRITE;
+        }
+#endif
+        ret = mprotect(g2h_untagged(starts[i]), lens[i], host_prot);
         if (ret != 0) {
             goto error;
         }
@@ -282,6 +303,17 @@ int target_mprotect(abi_ulong start, abi_ulong len, int target_prot)
             /* Commit into a reservation: the now-readable range needs KVM
              * slots. */
             kvm_user_track_range(start, len);
+            /* The mprotect just zapped this range's NPT; rebuild it in-kernel
+             * so the guest's next access does not VM-exit to fault it back in
+             * (no-op unless QEMU_KVM_PREFAULT_MPROTECT).  Only worth it when
+             * write is re-granted: that is the flip half the guest immediately
+             * writes.  A read-only re-grant is often flipped straight back to
+             * RW (SpiderMonkey's write-then-reprotect), so prefaulting it just
+             * doubles the work for a window nothing may touch; let those pages
+             * fault on demand. */
+            if (target_prot & PROT_WRITE) {
+                kvm_user_prefault_range(start, len);
+            }
         } else {
             /* Decommit (allocator mprotect(PROT_NONE)): the range is no
              * longer readable, so any chunk it just emptied of readable

@@ -54,6 +54,8 @@
 #include "user/signal.h"
 
 bool kvm_user_enabled;
+bool kvm_user_relax_mprotect;
+static bool kvm_have_prefault;   /* KVM_CAP_PRE_FAULT_MEMORY (Linux >= 6.11) */
 
 static int kvm_debug;
 #define DBG(...) do { if (kvm_debug) { fprintf(stderr, "qemu-kvm: " __VA_ARGS__); } } while (0)
@@ -108,6 +110,14 @@ static uint64_t sc_hist[SC_HIST_N];   /* per-syscall-number exit histogram */
 #define SEL_TSS  0x18
 
 #define SYSCALL_PORT 0x40
+
+/*
+ * Sandbox-backend hypercall port.  The guest ring-0 runtime issues
+ * `out %al,$SBX_PORT` to ask us to translate + pin a guest-VA range to its
+ * guest-physical addresses, which it needs to build a second (ring-3 sandbox)
+ * page table itself.  See sbx_translate_pin() and the KVM_EXIT_IO handler.
+ */
+#define SBX_PORT 0x41
 
 /* MSRs */
 /* MSR_IA32_TSC (0x10) comes from target/i386/cpu.h. */
@@ -209,6 +219,7 @@ static uint64_t cr3_gpa;              /* guest-physical of PML4             */
  */
 static uint32_t *chunk_map;           /* 16MiB GVA chunk -> GPA chunk (0=none) */
 static uint32_t *gpa_owner;           /* GPA chunk -> GVA chunk, or GPA_FREE   */
+static bool *gpa_pinned;              /* GPA chunk -> pinned (never recycled)  */
 static uint32_t *gpa_free_stack;      /* recycled GPA chunks (LIFO)            */
 static uint32_t n_gpa_free;
 static uint32_t next_gpa_chunk;       /* bump allocator; [0,CTRL_CHUNKS)=ctrl  */
@@ -688,7 +699,11 @@ void kvm_user_track_range(uint64_t start, uint64_t len)
  */
 void kvm_user_untrack_range(uint64_t start, uint64_t len)
 {
-    if (!kvm_user_enabled || vm_fd < 0 || len == 0) {
+    static int no_recycle = -1;
+    if (no_recycle < 0) {
+        no_recycle = getenv("QEMU_KVM_NO_RECYCLE") != NULL;
+    }
+    if (!kvm_user_enabled || vm_fd < 0 || len == 0 || no_recycle) {
         return;
     }
     mmap_lock();
@@ -703,7 +718,7 @@ void kvm_user_untrack_range(uint64_t start, uint64_t len)
          * PAGE_VALID is what lets an allocator's mprotect(PROT_NONE) decommit
          * recycle the chunk instead of pinning it for the reservation's life.
          */
-        if (chunk_map[c] &&
+        if (chunk_map[c] && !gpa_pinned[chunk_map[c]] &&
             !page_range_any_flags(c << CHUNK_BITS,
                                   (c << CHUNK_BITS) + chunk_span(c) - 1,
                                   PAGE_READ)) {
@@ -711,6 +726,96 @@ void kvm_user_untrack_range(uint64_t start, uint64_t len)
         }
     }
     mmap_unlock();
+}
+
+/*
+ * Sandbox-backend GPA translate + pin hypercall (SBX_PORT).  The guest ring-0
+ * runtime needs the guest-physical addresses backing its own memory so it can
+ * build a second, ring-3 sandbox page table by hand.  For each of `npages` 4 KiB
+ * pages starting at guest VA `va`, ensure the page's 16 MiB chunk is tracked
+ * (has a memslot + PDEs), mark that GPA chunk pinned so it is never recycled out
+ * from under the sandbox page tables, and write the page's GPA into out[i].  A
+ * zero entry means the page could not be translated (out of guest-physical
+ * space).  guest_base == 0, so `va` and `out` are directly addressable here.
+ *
+ * Runs under mmap_lock (like the track/untrack paths ensure_chunk expects).
+ */
+static void sbx_translate_pin(uint64_t va, uint64_t npages, uint64_t *out)
+{
+    mmap_lock();
+    for (uint64_t i = 0; i < npages; i++) {
+        uint64_t page = va + (i << TARGET_PAGE_BITS);
+        uint64_t c = page >> CHUNK_BITS;
+        uint64_t gpa = 0;
+        if (c < NUM_CHUNKS) {
+            ensure_chunk(page);
+            uint32_t g = chunk_map[c];
+            if (g) {
+                gpa_pinned[g] = true;
+                gpa = ((uint64_t)g << CHUNK_BITS) | (page & (CHUNK_SIZE - 1));
+            }
+        }
+        out[i] = gpa;
+    }
+    mmap_unlock();
+}
+
+/*
+ * Rebuild the NPT for [start, start+len) in-kernel via KVM_PRE_FAULT_MEMORY so
+ * the guest does not take a VM-exit fault the next time it touches a range whose
+ * NPT was just zapped by a host mprotect.  Semantics-preserving counterpart to
+ * QEMU_KVM_RELAX_MPROTECT: the guest's protection is still honored (a stray
+ * write to a page it left read-only still faults -- KVM_PRE_FAULT_MEMORY maps
+ * only what the current host protection permits), but the *legitimate* re-access
+ * after an mprotect that re-grants permission is serviced in-kernel instead of
+ * via a vCPU fault.  Opt in with QEMU_KVM_PREFAULT_MPROTECT; needs Linux >= 6.11
+ * (cap probed at setup).  Called from the mprotect hook after (re)tracking.
+ */
+void kvm_user_prefault_range(uint64_t start, uint64_t len)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("QEMU_KVM_PREFAULT_MPROTECT") != NULL;
+    }
+    /* Relaxed mode never zaps, so there is nothing to prefault. */
+    if (!enabled || kvm_user_relax_mprotect || !kvm_have_prefault ||
+        !kvm_user_enabled || vm_fd < 0) {
+        return;
+    }
+    CPUState *cs = current_cpu;
+    if (!cs) {
+        return;
+    }
+#ifdef KVM_PRE_FAULT_MEMORY
+    mmap_lock();
+    uint64_t end = start + len;
+    for (uint64_t va = start; va < end; ) {
+        uint64_t c = va >> CHUNK_BITS;
+        uint64_t seg_end = MIN(end, (c + 1) << CHUNK_BITS);
+        uint32_t g = (c < NUM_CHUNKS) ? chunk_map[c] : 0;
+        if (g) {
+            struct kvm_pre_fault_memory r = {
+                .gpa = ((uint64_t)g << CHUNK_BITS) | (va & (CHUNK_SIZE - 1)),
+                .size = seg_end - va,
+            };
+            while (r.size) {
+                uint64_t prev = r.size;
+                long n = ioctl(cs->kvm_fd, KVM_PRE_FAULT_MEMORY, &r);
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;       /* retry the remainder */
+                    }
+                    break;              /* hole/PROT_NONE page: let it fault */
+                }
+                if (r.size >= prev) {
+                    break;              /* no forward progress */
+                }
+            }
+        }
+        va = seg_end;
+    }
+    mmap_unlock();
+#endif
 }
 
 static int mirror_region_cb(void *priv, vaddr start, vaddr end, int flags)
@@ -758,6 +863,7 @@ static void setup_memory(void)
     for (uint32_t i = 0; i < pool_chunks; i++) {
         gpa_owner[i] = GPA_FREE;
     }
+    gpa_pinned = g_new0(bool, pool_chunks);
     gpa_free_stack = g_new(uint32_t, pool_chunks);
     n_gpa_free = 0;
     next_gpa_chunk = CTRL_CHUNKS;                /* [0,CTRL_CHUNKS) reserved */
@@ -1344,6 +1450,7 @@ void kvm_user_setup(CPUState *cs)
 {
     kvm_debug = getenv("QEMU_KVM_DEBUG") != NULL;
     kvm_stats = getenv("QEMU_KVM_STATS") != NULL;
+    kvm_user_relax_mprotect = getenv("QEMU_KVM_RELAX_MPROTECT") != NULL;
 
     if (guest_base != 0) {
         fprintf(stderr, "qemu-kvm: requires identity mapping (guest_base==0), "
@@ -1361,6 +1468,12 @@ void kvm_user_setup(CPUState *cs)
     kvm_mark_fd(vm_fd, true);
     DBG("vm created (fd=%d)\n", vm_fd);
     disable_slot_zap_quirk();
+#ifdef KVM_CAP_PRE_FAULT_MEMORY
+    kvm_have_prefault =
+        ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_PRE_FAULT_MEMORY) > 0;
+    DBG("KVM_PRE_FAULT_MEMORY %s\n",
+        kvm_have_prefault ? "available" : "unavailable (pre-6.11 kernel)");
+#endif
 
     setup_memory();
     setup_page_tables();
@@ -1691,6 +1804,19 @@ int kvm_cpu_exec_user(CPUState *cs)
                 env->eip = env->regs[R_ECX];
                 env->eflags = env->regs[11];
                 return EXCP_SYSCALL;
+            }
+            if (port == SBX_PORT) {
+                /*
+                 * Sandbox-backend GPA translate/pin hypercall: RDI = first
+                 * guest VA (page-aligned), RSI = page count, RDX = guest VA of
+                 * a uint64_t[count] result buffer.  Handle it in-place and
+                 * resume the guest right after the `out` -- do not touch
+                 * env->eip, so KVM's fast-PIO completion advances RIP itself
+                 * (the kvm_is_linear_rip guard requires an unchanged RIP).
+                 */
+                sbx_translate_pin(env->regs[R_EDI], env->regs[R_ESI],
+                                  (uint64_t *)(uintptr_t)env->regs[R_EDX]);
+                break;
             }
             if (port == 0x80) {
                 struct ist_frame f;

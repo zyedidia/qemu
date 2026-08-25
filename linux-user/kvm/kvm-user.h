@@ -16,6 +16,14 @@
  */
 extern bool kvm_user_enabled;
 
+/*
+ * When true (QEMU_KVM_RELAX_MPROTECT), keep any guest page the guest leaves
+ * readable mapped host-writable, so an allocator/JIT that repeatedly flips a
+ * page RW<->R does not churn its NPT entry (see target_mprotect).  Only
+ * meaningful in KVM mode; false unless explicitly enabled.
+ */
+extern bool kvm_user_relax_mprotect;
+
 #if defined(TARGET_X86_64)
 /*
  * Build the VM, blanket memslots and ring-0 nanokernel, then create and prime
@@ -47,6 +55,14 @@ void kvm_user_track_range(uint64_t start, uint64_t len);
  * mode is active and the VM has been created.
  */
 void kvm_user_untrack_range(uint64_t start, uint64_t len);
+
+/*
+ * After a host mprotect re-grants access to [start, start+len), rebuild that
+ * range's NPT in-kernel (KVM_PRE_FAULT_MEMORY) so the guest's next access does
+ * not VM-exit to fault it back in.  Preserves the guest's protection semantics.
+ * No-op unless QEMU_KVM_PREFAULT_MPROTECT is set and the kernel supports it.
+ */
+void kvm_user_prefault_range(uint64_t start, uint64_t len);
 
 /*
  * Sync FP/SIMD state between the vCPU and env, called by the signal-frame code:
