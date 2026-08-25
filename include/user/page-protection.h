@@ -64,6 +64,18 @@ bool page_check_range(vaddr start, vaddr last, int flags);
 bool page_check_range_empty(vaddr start, vaddr last);
 
 /**
+ * page_range_any_flags:
+ * @start: first byte of range
+ * @last: last byte of range
+ * @flags: flags to test for
+ *
+ * Return true if any mapped page in [@start, @last] has all of @flags set.
+ * The memory lock must be held.  Complements page_check_range(), which
+ * requires *every* page to have the flags; this asks whether *any* does.
+ */
+bool page_range_any_flags(vaddr start, vaddr last, int flags);
+
+/**
  * page_find_range_empty
  * @min: first byte of search range
  * @max: last byte of search range

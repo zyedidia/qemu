@@ -4,17 +4,18 @@
  * Instead of TCG-translating the guest, we run it natively inside a KVM VM at
  * ring 0 (long mode, CPL0).  Guest-virtual == host-virtual (guest_base == 0),
  * so linux-user's host mappings back the guest's directly.  Guest-PHYSICAL
- * space is separate and private to us: guest VA space is carved into 1 GiB
- * chunks, and each chunk that contains a guest mapping owns a 1 GiB-aligned
- * GPA chunk from a small pool, wired up by one KVM memslot (GPA chunk -> the
- * chunk's host VA) plus one 1 GiB PDPTE in the guest page tables (guest VA ->
+ * space is separate and private to us: guest VA space is carved into 16 MiB
+ * chunks, and each chunk that contains a readable guest page owns a compact
+ * GPA chunk from a pool, wired up by one KVM memslot (GPA chunk -> the chunk's
+ * host VA) plus eight 2 MiB leaf PDEs in the guest page tables (guest VA ->
  * GPA chunk).  A guest access to mapped memory thus GUPs the identical host
  * page (it just works); an access to a host-unmapped or PROT_NONE page inside
  * a live chunk fails GUP and returns a bare -EFAULT from KVM_RUN with the
  * guest RIP left at the faulting instruction; an access to a VA with no chunk
- * takes a guest #PF with an exact CR2.  When munmap/mremap/shmdt leaves a
- * chunk with no guest mapping at all, its slot is deleted and its GPA chunk
- * recycled (kvm_user_untrack_range).
+ * takes a guest #PF with an exact CR2.  When munmap/mremap/shmdt/mprotect
+ * leaves a chunk with no readable page, its slot is deleted and its GPA chunk
+ * recycled (kvm_user_untrack_range).  See the CHUNK_BITS comment for why the
+ * unit is 16 MiB.
  *
  * (Identity GVA == GPA is NOT viable: usable guest-physical width is the
  * host's MAXPHYADDR, commonly just 39 bits = 512 GiB, while host mmap
@@ -65,21 +66,30 @@ static uint64_t st_syscall, st_fault, st_eintr, st_exc, st_other, st_total;
 /* Control region: guest page tables + nanokernel, in GPA chunk 0.     */
 /* ------------------------------------------------------------------ */
 
-#define CTRL_GPA     0x00000000ULL         /* GPA chunk 0, reserved for us   */
-#define CTRL_SIZE    0x00800000ULL         /* 8 MiB                          */
-#define PT_OFF       0x00000000ULL         /* page tables at ctrl + 0        */
+#define CTRL_GPA     0x00000000ULL         /* control region base GPA        */
+#define PT_OFF       0x00000000ULL         /* base page tables at ctrl + 0   */
 
-/* page-table page indices within the PT area (layout: setup_page_tables) */
+/* Base page-table page indices within the control region. */
 #define PT_PML4_PAGE   0
 #define PT_PDPT0_PAGE  1                   /* 256 user PDPTs: pages 1..256   */
 #define PT_PDPTK_PAGE  257                 /* kernel-half PDPT               */
 #define PT_PDK_PAGE    258                 /* kernel-half PD                 */
-#define PT_TOP_PD_PAGE 259                 /* top partial chunk: PD ...      */
-#define PT_TOP_PT_PAGE 260                 /*  ... and its last PT           */
-#define PT_PAGES       261
+#define PT_TOP_PT_PAGE 259                 /* PT for the partial 2 MiB at USER_VA_END */
+#define PT_BASE_PAGES  260                 /* base tables occupy [0, 260)    */
+
 #define NANO_OFF     0x00400000ULL         /* nanokernel at ctrl + 4 MiB     */
 #define NANO_GPA     (CTRL_GPA + NANO_OFF)
 #define NANO_SIZE    0x00200000ULL         /* one 2 MiB page                 */
+
+/*
+ * Per-region page directories: one PD page per 1 GiB user region, at a fixed
+ * control-region offset (region r -> PD_POOL_OFF + r*4096).  PDPTEs point at
+ * these statically (set once at setup); only the leaf 2 MiB PDEs are toggled
+ * on the fly by ensure_chunk()/free_chunk().  The pool spans the whole user
+ * range but is lazily backed, so untouched regions cost no memory.  It sits
+ * above the nanokernel [4,6) MiB.
+ */
+#define PD_POOL_OFF  0x00800000ULL         /* 8 MiB */
 
 #define NANO_VA_BASE 0xffffffff80000000ULL /* kernel-half VA of the nanokernel */
 
@@ -134,21 +144,47 @@ static uint64_t st_syscall, st_fault, st_eintr, st_exc, st_other, st_total;
 #define USER_VA_END  0x00007ffffffff000ULL
 
 /*
- * GVA -> GPA translation is at 1 GiB "chunk" granularity, on demand.  A GVA
- * chunk that contains a guest mapping owns a 1 GiB-aligned GPA chunk from a
- * pool sized by the host's usable guest-physical width (39-bit MAXPHYADDR =
- * 512 chunks), wired up by one memslot (slot id == GPA chunk index;
- * userspace_addr == the chunk's GVA) and one 1 GiB PDPTE.  Within a live
- * chunk the host mapping and its protection remain the source of truth via
- * GUP: holes (unmapped / munmap'd / PROT_NONE) fail GUP -> -EFAULT, so
- * mprotect and partial munmap need no bookkeeping here at all.  Only when a
- * whole chunk no longer contains any guest mapping is it torn down and its
- * GPA chunk recycled (kvm_user_untrack_range), so KVM per-slot metadata and
- * GPA space both stay proportional to memory the guest actually uses.
+ * GVA -> GPA translation is at 16 MiB "chunk" granularity, on demand.  A GVA
+ * chunk that contains a readable guest page owns a 16 MiB-aligned GPA chunk
+ * from a compact pool (bump-allocated + recycled), wired up by one memslot
+ * (slot id == GPA chunk index; userspace_addr == the chunk's GVA) and eight
+ * 2 MiB leaf PDEs in its region's page directory.  Within a live chunk the
+ * host mapping and its protection remain the source of truth via GUP: holes
+ * (unmapped / munmap'd / PROT_NONE) fail GUP -> -EFAULT, so a partial munmap
+ * or a mprotect that leaves some readable page needs no bookkeeping here at
+ * all.  Only when a whole chunk no longer holds any readable page -- every
+ * page unmapped or decommitted to PROT_NONE -- is it torn down and its GPA
+ * chunk recycled (kvm_user_untrack_range).
+ *
+ * Why 16 MiB and 2 MiB PDEs rather than 1 GiB PDPTEs: guest-physical space is
+ * scarce (39-bit MAXPHYADDR = 512 GiB here) while a real process (e.g. a
+ * browser content process) scatters ~1 GiB of live memory as a few MiB in
+ * each of hundreds of distinct 1 GiB windows.  At 1 GiB granularity each such
+ * window burned a whole GPA chunk and the 512-chunk pool exhausted with the
+ * process barely started.  16 MiB chunks cut that waste ~64x while a chunk
+ * still amortises one memslot over enough GPA that the memslot cap
+ * (KVM_CAP_NR_MEMSLOTS) and the 512 GiB GPA cap coincide -- so total coverage
+ * is unchanged.  CHUNK_BITS is the single knob: raise it toward 30 to favour
+ * huge dense mappings, lower it toward 21 to favour sparse ones.
  */
-#define CHUNK_BITS  30
+#define CHUNK_BITS  24                     /* 16 MiB translation unit */
 #define CHUNK_SIZE  (1ULL << CHUNK_BITS)
 #define NUM_CHUNKS  ((USER_VA_END + CHUNK_SIZE - 1) >> CHUNK_BITS)
+
+#define PDE_BITS        21                 /* 2 MiB leaf pages */
+#define PDE_SIZE        (1ULL << PDE_BITS)
+#define REGION_BITS     30                 /* 1 GiB: one page directory's span */
+#define REGION_SIZE     (1ULL << REGION_BITS)
+#define NUM_REGIONS     ((USER_VA_END + REGION_SIZE - 1) >> REGION_BITS)
+#define PDES_PER_CHUNK  (CHUNK_SIZE / PDE_SIZE)               /* 8   */
+#define CHUNKS_PER_REGION (REGION_SIZE / CHUNK_SIZE)          /* 64  */
+
+/* Control region: base tables + nanokernel + the per-region PD pool, rounded
+ * up to a chunk.  Sits in the low GPA chunks, which are reserved from the
+ * allocator (CTRL_CHUNKS of them). */
+#define CTRL_SIZE ((PD_POOL_OFF + NUM_REGIONS * 4096ULL + CHUNK_SIZE - 1) \
+                   & ~(CHUNK_SIZE - 1))
+#define CTRL_CHUNKS (CTRL_SIZE >> CHUNK_BITS)
 
 #define GPA_FREE    UINT32_MAX
 
@@ -168,12 +204,13 @@ static uint64_t cr3_gpa;              /* guest-physical of PML4             */
  * single-threaded); gpa_owner is additionally read locklessly on the
  * KVM_EXIT_MMIO path, hence the qatomic accessors there.
  */
-static uint32_t *chunk_map;           /* GVA chunk -> its GPA chunk (0 = none) */
+static uint32_t *chunk_map;           /* 16MiB GVA chunk -> GPA chunk (0=none) */
 static uint32_t *gpa_owner;           /* GPA chunk -> GVA chunk, or GPA_FREE   */
 static uint32_t *gpa_free_stack;      /* recycled GPA chunks (LIFO)            */
 static uint32_t n_gpa_free;
-static uint32_t next_gpa_chunk;       /* bump allocator; chunk 0 is control    */
-static uint32_t pool_chunks;          /* GPA chunks usable: [1, pool_chunks)   */
+static uint32_t next_gpa_chunk;       /* bump allocator; [0,CTRL_CHUNKS)=ctrl  */
+static uint32_t pool_chunks;          /* GPA chunks total: usable are          */
+                                      /* [CTRL_CHUNKS, pool_chunks)            */
 
 /* Per-vCPU (per guest thread) state, hung off CPUState::accel. */
 typedef struct KVMUserVCPU {
@@ -386,18 +423,88 @@ static uint64_t probe_gpa_limit(void)
     _exit(1);
 }
 
-/* PDPTE slot for a user GVA chunk (layout fixed by setup_page_tables). */
-static uint64_t *user_pdpte(uint64_t gva_chunk)
+/* First of the PDES_PER_CHUNK (8) leaf 2 MiB PDEs backing GVA chunk c, in its
+ * region's statically-placed page directory (layout fixed by setup_page_tables). */
+static uint64_t *chunk_pdes(uint64_t c)
 {
-    uint64_t *pdpt =
-        (uint64_t *)(ctrl + PT_OFF + (1 + (gva_chunk >> 9)) * 4096);
-    return &pdpt[gva_chunk & 511];
+    uint64_t region = c / CHUNKS_PER_REGION;
+    uint64_t sub    = c % CHUNKS_PER_REGION;
+    uint64_t *pd = (uint64_t *)(ctrl + PD_POOL_OFF + region * 4096);
+    return &pd[sub * PDES_PER_CHUNK];
 }
 
 /* Memslot span of a GVA chunk (the top chunk stops at USER_VA_END). */
 static uint64_t chunk_span(uint64_t gva_chunk)
 {
     return MIN(CHUNK_SIZE, USER_VA_END - (gva_chunk << CHUNK_BITS));
+}
+
+/*
+ * On exhaustion, characterize the live chunk set so the cause is diagnosable:
+ * sum the guest's readable bytes and bucket each live chunk by how much of its
+ * CHUNK_SIZE is readable.  A set dominated by nearly-empty chunks
+ * (readable_total << live * CHUNK_SIZE) means fragmentation or a leaked
+ * decommit path -- finer granularity or a missing untrack.  Chunks that are
+ * mostly full mean a genuine working set that needs more guest-physical space.
+ * Runs once, under mmap_lock (held by the track path), just before we fault.
+ */
+static uint64_t *stat_readable_per_gpa;
+static uint64_t stat_readable_total;
+
+static int exhaust_stat_cb(void *priv, vaddr start, vaddr end, int flags)
+{
+    if (!(flags & PAGE_READ)) {
+        return 0;
+    }
+    stat_readable_total += end - start;
+    for (uint64_t c = start >> CHUNK_BITS; c <= (end - 1) >> CHUNK_BITS; c++) {
+        if (c < NUM_CHUNKS && chunk_map[c] && chunk_map[c] < pool_chunks) {
+            uint64_t cs = c << CHUNK_BITS, ce = cs + CHUNK_SIZE;
+            uint64_t ov = MIN(end, ce) - MAX(start, cs);
+            stat_readable_per_gpa[chunk_map[c]] += ov;
+        }
+    }
+    return 0;
+}
+
+static void dump_exhaustion_stats(void)
+{
+    unsigned live = 0, b_tiny = 0, b_small = 0, b_mid = 0, b_full = 0;
+
+    stat_readable_per_gpa = g_new0(uint64_t, pool_chunks);
+    stat_readable_total = 0;
+    walk_memory_regions(NULL, exhaust_stat_cb);
+
+    for (uint32_t g = CTRL_CHUNKS; g < pool_chunks; g++) {
+        if (qatomic_read(&gpa_owner[g]) == GPA_FREE) {
+            continue;
+        }
+        live++;
+        uint64_t r = stat_readable_per_gpa[g];   /* readable of this 16 MiB */
+        if (r < (1u << 20)) {
+            b_tiny++;                            /* < 1 MiB: near-empty */
+        } else if (r < (CHUNK_SIZE / 4)) {
+            b_small++;                           /* < quarter full */
+        } else if (r < CHUNK_SIZE) {
+            b_mid++;                             /* partial */
+        } else {
+            b_full++;                            /* full 16 MiB */
+        }
+    }
+    fprintf(stderr,
+        "qemu-kvm: [exhaustion] live chunks=%u  readable total=%llu MiB "
+        "(%.1f%% of chunk span)\n"
+        "qemu-kvm: [exhaustion] per-chunk readable: <1MiB=%u  <4MiB=%u  "
+        "<16MiB=%u  full=%u\n"
+        "qemu-kvm: [exhaustion] %s\n",
+        live, (unsigned long long)(stat_readable_total >> 20),
+        live ? 100.0 * stat_readable_total / ((uint64_t)live << CHUNK_BITS) : 0.0,
+        b_tiny, b_small, b_mid, b_full,
+        (b_tiny + b_small) > live / 2
+        ? "mostly-empty chunks -> fragmentation or a leaked decommit path"
+        : "chunks mostly full -> genuine working set exceeds guest-physical space");
+    g_free(stat_readable_per_gpa);
+    stat_readable_per_gpa = NULL;
 }
 
 static uint32_t alloc_gpa_chunk(void)
@@ -409,60 +516,60 @@ static uint32_t alloc_gpa_chunk(void)
         return next_gpa_chunk++;
     }
     /*
-     * Out of guest-physical space: pool_chunks-1 distinct GVA chunks hold
-     * live mappings simultaneously.  Leave this chunk untranslated; a guest
-     * access to it will take #PF -> SIGSEGV.
+     * Out of guest-physical space: all usable GPA chunks hold live mappings
+     * simultaneously.  Leave this chunk untranslated; a guest access to it
+     * will take #PF -> SIGSEGV.
      */
     static bool warned;
     if (!warned) {
         warned = true;
-        fprintf(stderr, "qemu-kvm: out of guest-physical space (%u 1 GiB "
+        fprintf(stderr, "qemu-kvm: out of guest-physical space (%u %llu MiB "
                 "chunks in simultaneous use); guest accesses to further "
-                "mappings will fault\n", pool_chunks - 1);
+                "mappings will fault\n",
+                pool_chunks - (unsigned)CTRL_CHUNKS,
+                (unsigned long long)(CHUNK_SIZE >> 20));
+        dump_exhaustion_stats();
     }
     return 0;
 }
 
 /*
- * Install the guest translation for chunk c -> GPA chunk g.  A full chunk is
- * a single 1 GiB PDPTE.  The one partial chunk at the top of the user range
- * instead gets an exact 2 MiB + 4 KiB tree stopping at USER_VA_END: a 1 GiB
- * PDPTE would let accesses in [USER_VA_END, 2^47) reach GPAs beyond the
- * chunk's memslot, and a no-slot GPA access puts the vCPU into KVM's
- * in-kernel MMIO emulation, from which no clean #PF can be delivered (see
- * KVM_EXIT_MMIO in the run loop).  With exact tables those accesses take a
- * guest #PF like any other unmapped VA.
+ * Install the guest translation for chunk c -> GPA chunk g: the chunk's eight
+ * 2 MiB leaf PDEs.  A full chunk is eight 2 MiB PS pages.  The one partial
+ * chunk at the top of the user range instead drops its last 2 MiB PDE to a
+ * 4 KiB PT that stops exactly at USER_VA_END: a PS page there would let
+ * accesses in [USER_VA_END, region end) reach GPAs beyond the chunk's
+ * memslot, and a no-slot GPA access puts the vCPU into KVM's in-kernel MMIO
+ * emulation, from which no clean #PF can be delivered (see KVM_EXIT_MMIO in
+ * the run loop).  With an exact tail those accesses take a guest #PF like any
+ * other unmapped VA.
  */
 static void install_chunk_pte(uint64_t c, uint32_t g)
 {
     uint64_t gpa = (uint64_t)g << CHUNK_BITS;
     uint64_t span = chunk_span(c);
+    uint64_t *pde = chunk_pdes(c);
 
-    if (span == CHUNK_SIZE) {
-        *user_pdpte(c) = gpa | PTE_P | PTE_RW | PTE_PS;
-        return;
-    }
-    /* Only the single top chunk is partial, so one static PD/PT pair does. */
-    uint64_t *pd = (uint64_t *)(ctrl + PT_OFF + PT_TOP_PD_PAGE * 4096);
-    uint64_t *pt = (uint64_t *)(ctrl + PT_OFF + PT_TOP_PT_PAGE * 4096);
-    for (uint64_t j = 0; j < 512; j++) {
-        uint64_t off = j << 21;
-        if (off + (1ULL << 21) <= span) {
-            pd[j] = (gpa + off) | PTE_P | PTE_RW | PTE_PS;
-        } else {
-            pd[j] = (CTRL_GPA + PT_OFF + PT_TOP_PT_PAGE * 4096) |
-                    PTE_P | PTE_RW;
+    for (uint64_t j = 0; j < PDES_PER_CHUNK; j++) {
+        uint64_t off = j << PDE_BITS;
+        if (off + PDE_SIZE <= span) {
+            pde[j] = (gpa + off) | PTE_P | PTE_RW | PTE_PS;   /* full 2 MiB */
+        } else if (off < span) {
+            /* Partial 2 MiB (only the top chunk): exact 4 KiB PT. */
+            uint64_t *pt = (uint64_t *)(ctrl + PT_OFF + PT_TOP_PT_PAGE * 4096);
             for (uint64_t k = 0; k < 512; k++) {
                 uint64_t poff = off + (k << 12);
                 pt[k] = poff < span ? (gpa + poff) | PTE_P | PTE_RW : 0;
             }
+            pde[j] = (CTRL_GPA + PT_OFF + PT_TOP_PT_PAGE * 4096) |
+                     PTE_P | PTE_RW;
+        } else {
+            pde[j] = 0;                          /* beyond span (top chunk) */
         }
     }
-    *user_pdpte(c) = (CTRL_GPA + PT_OFF + PT_TOP_PD_PAGE * 4096) |
-                     PTE_P | PTE_RW;
 }
 
-/* Give the 1 GiB GVA chunk containing va a GPA chunk, memslot and PTEs. */
+/* Give the 16 MiB GVA chunk containing va a GPA chunk, memslot and leaf PDEs. */
 static void ensure_chunk(uint64_t va)
 {
     uint64_t c = va >> CHUNK_BITS;
@@ -480,10 +587,11 @@ static void ensure_chunk(uint64_t va)
     chunk_map[c] = g;
     qatomic_set(&gpa_owner[g], (uint32_t)c);
     /*
-     * Slot before PTEs: a concurrent vCPU's page walk must never find a
+     * Slot before PDEs: a concurrent vCPU's page walk must never find a
      * translation to a slotless GPA (that would surface as spurious MMIO).
      * Not-present entries are never cached, so the install itself needs no
-     * TLB invalidation.
+     * TLB invalidation.  (The PDPTE above these PDEs is static and always
+     * present -- see setup_page_tables -- so only the leaves toggle.)
      */
     add_memslot(g, (uint64_t)g << CHUNK_BITS, c << CHUNK_BITS, chunk_span(c));
     install_chunk_pte(c, g);
@@ -496,15 +604,19 @@ static void ensure_chunk(uint64_t va)
 static void free_chunk(uint64_t c)
 {
     uint32_t g = chunk_map[c];
+    uint64_t *pde = chunk_pdes(c);
 
     /*
-     * PDPTE first, so a page walk after the flush below faults instead of
+     * Leaf PDEs first, so a page walk after the flush below faults instead of
      * re-creating a translation; then the slot DELETE, which zaps the chunk's
      * EPT entries and flushes every vCPU's TLB (evicting any stale
      * GVA->GPA->HVA translation) before returning.  Only after that may the
-     * GPA chunk be handed to a different GVA chunk.
+     * GPA chunk be handed to a different GVA chunk.  The region's PD and
+     * PDPTE stay in place (static); an all-zero PD simply faults.
      */
-    *user_pdpte(c) = 0;
+    for (uint64_t j = 0; j < PDES_PER_CHUNK; j++) {
+        pde[j] = 0;
+    }
     del_memslot(g);
     chunk_map[c] = 0;
     qatomic_set(&gpa_owner[g], GPA_FREE);
@@ -524,7 +636,7 @@ void kvm_user_track_range(uint64_t start, uint64_t len)
     if (!kvm_user_enabled || vm_fd < 0 || len == 0) {
         return;
     }
-    mmap_lock();                   /* serializes all chunk/PDPTE bookkeeping */
+    mmap_lock();                   /* serializes all chunk/PDE bookkeeping */
     uint64_t end = start + len;
     for (uint64_t g = start & ~(CHUNK_SIZE - 1); g < end; g += CHUNK_SIZE) {
         ensure_chunk(g);
@@ -533,10 +645,11 @@ void kvm_user_track_range(uint64_t start, uint64_t len)
 }
 
 /*
- * Recycle any chunk in [start, start+len) that no longer contains any guest
- * mapping.  Called from the mmap layer after munmap/mremap/shmdt cleared the
- * range's page flags; the emptiness test and the teardown run under mmap_lock
- * so they are atomic against concurrent mmap.
+ * Recycle any chunk in [start, start+len) that no longer contains a readable
+ * guest page.  Called from the mmap layer after munmap/mremap/shmdt removed a
+ * mapping or mprotect made a range non-readable (decommit); the readability
+ * test and the teardown run under mmap_lock so they are atomic against
+ * concurrent mmap.
  */
 void kvm_user_untrack_range(uint64_t start, uint64_t len)
 {
@@ -547,9 +660,18 @@ void kvm_user_untrack_range(uint64_t start, uint64_t len)
     uint64_t last_c = MIN((start + len - 1) >> CHUNK_BITS,
                           (uint64_t)NUM_CHUNKS - 1);
     for (uint64_t c = start >> CHUNK_BITS; c <= last_c; c++) {
+        /*
+         * A chunk's slot exists only to let KVM GUP readable host pages; a
+         * page with no PAGE_READ (PROT_NONE reservation or decommit) fails
+         * GUP anyway.  So the chunk is live iff some page in it is still
+         * readable -- NOT merely still mapped.  Testing PAGE_READ rather than
+         * PAGE_VALID is what lets an allocator's mprotect(PROT_NONE) decommit
+         * recycle the chunk instead of pinning it for the reservation's life.
+         */
         if (chunk_map[c] &&
-            page_check_range_empty(c << CHUNK_BITS,
-                                   (c << CHUNK_BITS) + chunk_span(c) - 1)) {
+            !page_range_any_flags(c << CHUNK_BITS,
+                                  (c << CHUNK_BITS) + chunk_span(c) - 1,
+                                  PAGE_READ)) {
             free_chunk(c);
         }
     }
@@ -575,20 +697,26 @@ static int mirror_region_cb(void *priv, vaddr start, vaddr end, int flags)
 
 static void setup_memory(void)
 {
-    /* Size the GPA chunk pool: chunk 0 is the control region, the rest are
-     * handed out to GVA chunks (each also needs a memslot of its own). */
+    /*
+     * Size the GPA chunk pool.  The low CTRL_CHUNKS chunks are the control
+     * region (one big memslot, slot 0); the rest are handed out to GVA chunks,
+     * each with its own memslot whose id is the GPA chunk index.  The pool is
+     * capped by both guest-physical space and the memslot count; at 16 MiB
+     * chunks on a 39-bit host these coincide near 512 GiB.
+     */
     uint64_t gpa_limit = probe_gpa_limit();
     int nr_slots = ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_NR_MEMSLOTS);
     if (nr_slots <= 0) {
         nr_slots = 32;                          /* KVM's historical default */
     }
     pool_chunks = MIN(gpa_limit >> CHUNK_BITS, (uint64_t)nr_slots);
-    if (pool_chunks < 4) {
-        fprintf(stderr, "qemu-kvm: guest-physical space too small (%u GiB)\n",
-                pool_chunks);
+    if (pool_chunks <= CTRL_CHUNKS + 4) {
+        fprintf(stderr, "qemu-kvm: guest-physical space too small\n");
         _exit(1);
     }
-    DBG("gpa pool: %u usable 1 GiB chunks\n", pool_chunks - 1);
+    DBG("gpa pool: %u usable %llu MiB chunks (control uses %u)\n",
+        pool_chunks - (unsigned)CTRL_CHUNKS,
+        (unsigned long long)(CHUNK_SIZE >> 20), (unsigned)CTRL_CHUNKS);
 
     chunk_map = g_malloc0(NUM_CHUNKS * sizeof(*chunk_map));
     gpa_owner = g_new(uint32_t, pool_chunks);
@@ -597,11 +725,12 @@ static void setup_memory(void)
     }
     gpa_free_stack = g_new(uint32_t, pool_chunks);
     n_gpa_free = 0;
-    next_gpa_chunk = 1;
+    next_gpa_chunk = CTRL_CHUNKS;                /* [0,CTRL_CHUNKS) reserved */
 
-    /* Control region (page tables + nanokernel) in GPA chunk 0. */
+    /* Control region: base page tables + nanokernel + per-region PD pool.
+     * Large but lazily backed -- only touched PDs consume memory. */
     ctrl = mmap(NULL, CTRL_SIZE, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (ctrl == MAP_FAILED) {
         perror("qemu-kvm: mmap control region");
         _exit(1);
@@ -617,16 +746,18 @@ static void setup_memory(void)
 static void setup_page_tables(void)
 {
     /*
-     * PML4[0..255] -> 256 initially-empty PDPTs covering user VAs [0, 2^47);
-     * their 1 GiB PDPTEs are demand-installed by ensure_chunk() to point at
-     * allocated GPA chunks (and cleared again by free_chunk()).  PML4[511] ->
-     * a chain mapping the nanokernel's kernel-half VA to NANO_GPA.  Tables
-     * live in the control region; a table page at control offset O has
-     * guest-physical address CTRL_GPA + O.
+     * PML4[0..255] -> 256 PDPTs covering user VAs [0, 2^47).  Every user PDPTE
+     * is set once here to point at its 1 GiB region's page directory in the PD
+     * pool (region r's PD at PD_POOL_OFF + r*4096); those PDs start all-zero
+     * (lazily backed) and only their leaf 2 MiB PDEs are demand-installed by
+     * ensure_chunk()/free_chunk().  Keeping the PDPTE->PD level static means it
+     * is never cached-then-stale, so no paging-structure-cache flush is ever
+     * needed there.  PML4[511] -> a chain mapping the nanokernel's kernel-half
+     * VA to NANO_GPA.  A table page at control offset O has GPA CTRL_GPA + O.
      */
     const int NUSER = 256;
     uint8_t *base = ctrl + PT_OFF;
-    memset(base, 0, PT_PAGES * 4096);
+    memset(base, 0, PT_BASE_PAGES * 4096);
 
     uint64_t *pml4  = (uint64_t *)(base + PT_PML4_PAGE * 4096);
     uint64_t *pdptk = (uint64_t *)(base + PT_PDPTK_PAGE * 4096);
@@ -636,6 +767,12 @@ static void setup_page_tables(void)
     for (int i = 0; i < NUSER; i++) {
         pml4[i] = (gpa_base + (uint64_t)(PT_PDPT0_PAGE + i) * 4096) |
                   PTE_P | PTE_RW;
+    }
+
+    /* Point every user region's PDPTE at its static PD page. */
+    for (uint64_t r = 0; r < NUM_REGIONS; r++) {
+        uint64_t *pdpt = (uint64_t *)(base + (PT_PDPT0_PAGE + (r >> 9)) * 4096);
+        pdpt[r & 511] = (CTRL_GPA + PD_POOL_OFF + r * 4096) | PTE_P | PTE_RW;
     }
 
     /* Kernel-half chain for the nanokernel VA: PML4[511]->PDPTk[510]->PDk[0]. */
@@ -1068,11 +1205,12 @@ void kvm_user_fork_child(CPUState *cs)
     kvm_mark_fd(vm_fd, true);
 
     /*
-     * The control region and the chunk allocator state are plain COW memory
-     * and survive fork intact, and the inherited guest page tables encode the
-     * parent's GVA -> GPA chunk assignment.  Rebuild the slots from
-     * chunk_map[] verbatim -- NOT by re-walking the mappings, which could
-     * assign GPA chunks differently from what the PDPTEs say.
+     * The control region (base tables, per-region PDs and their leaf PDEs)
+     * and the chunk allocator state are plain COW memory and survive fork
+     * intact, so the inherited page tables already encode the parent's
+     * GVA -> GPA chunk assignment.  Rebuild the memslots from chunk_map[]
+     * verbatim -- NOT by re-walking the mappings, which could assign GPA
+     * chunks differently from what the PDEs say.
      */
     add_memslot(0, CTRL_GPA, (uint64_t)(uintptr_t)ctrl, CTRL_SIZE);
     for (uint64_t c = 0; c < NUM_CHUNKS; c++) {
@@ -1116,7 +1254,7 @@ void kvm_user_setup(CPUState *cs)
     DBG("nanokernel done\n");
 
     /* Map the guest mappings that exist at load time.  Must follow
-     * setup_page_tables(): the walk installs PDPTEs. */
+     * setup_page_tables(): the walk installs leaf PDEs. */
     walk_memory_regions(NULL, mirror_region_cb);
     DBG("load-time mappings mapped (%u gpa chunks)\n", next_gpa_chunk - 1);
 
@@ -1468,9 +1606,10 @@ int kvm_cpu_exec_user(CPUState *cs)
                     /*
                      * Guest #PF, CR2 exact.  Fires for the legacy vsyscall
                      * page, for other kernel-half VAs, and for any user VA
-                     * whose chunk has no translation: unmapped memory, or a
-                     * mapping whose PDPTE was racing in (then the retry
-                     * below resumes it).
+                     * whose chunk has no translation: unmapped memory, a
+                     * mapping decommitted to PROT_NONE (still PAGE_VALID, but
+                     * its chunk was recycled), or a mapping whose PDPTE was
+                     * racing in (then the retry below resumes it).
                      */
                     uint64_t cr2 = read_cr2(cs);
                     if ((cr2 & ~0xfffULL) == VSYSCALL_PAGE) {
@@ -1486,7 +1625,17 @@ int kvm_cpu_exec_user(CPUState *cs)
                             continue;
                         }
                     }
+                    /*
+                     * The hardware error code's P bit only reflects our coarse
+                     * chunk tables, where "no chunk" covers both truly
+                     * unmapped memory and a mapped-but-PROT_NONE page.  Derive
+                     * the guest-visible code from linux-user's page flags
+                     * instead so si_code is SEGV_ACCERR vs SEGV_MAPERR
+                     * correctly (keep only the hardware W bit for direction).
+                     */
                     env->cr[2] = cr2;
+                    env->error_code =
+                        fault_error_code(cr2, ec & PG_ERROR_W_MASK);
                     return EXCP0E_PAGE;
                 }
                 case 16:                          /* #MF: x87 FP exception */

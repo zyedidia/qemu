@@ -591,6 +591,22 @@ bool page_check_range_empty(vaddr start, vaddr last)
     return pageflags_find(start, last) == NULL;
 }
 
+bool page_range_any_flags(vaddr start, vaddr last, int flags)
+{
+    PageFlagsNode *p;
+
+    assert(last >= start);
+    assert_memory_lock();
+
+    for (p = pageflags_find(start, last); p;
+         p = pageflags_next(p, start, last)) {
+        if ((p->flags & flags) == flags) {
+            return true;
+        }
+    }
+    return false;
+}
+
 vaddr page_find_range_empty(vaddr min, vaddr max, vaddr len, vaddr align)
 {
     vaddr len_m1, align_m1;

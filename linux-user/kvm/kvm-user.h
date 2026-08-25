@@ -41,9 +41,10 @@ void kvm_user_track_range(uint64_t start, uint64_t len);
 
 /*
  * Tear down and recycle the translation of any 1 GiB chunk in
- * [start, start+len) that no longer contains any guest mapping.  Called from
- * the mmap layer after munmap/mremap/shmdt have cleared the range's page
- * flags.  No-op unless KVM mode is active and the VM has been created.
+ * [start, start+len) that no longer contains a readable guest page.  Called
+ * from the mmap layer after munmap/mremap/shmdt removed a mapping, or after
+ * mprotect made a range non-readable (allocator decommit).  No-op unless KVM
+ * mode is active and the VM has been created.
  */
 void kvm_user_untrack_range(uint64_t start, uint64_t len);
 

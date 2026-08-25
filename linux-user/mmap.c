@@ -277,10 +277,20 @@ int target_mprotect(abi_ulong start, abi_ulong len, int target_prot)
  error:
     mmap_unlock();
 #ifdef TARGET_X86_64
-    /* A PROT_NONE->readable transition (commit into a reservation) needs KVM
-     * slots for the now-accessible range. */
-    if (ret == 0 && kvm_user_enabled && (target_prot & PROT_READ)) {
-        kvm_user_track_range(start, len);
+    if (ret == 0 && kvm_user_enabled) {
+        if (target_prot & PROT_READ) {
+            /* Commit into a reservation: the now-readable range needs KVM
+             * slots. */
+            kvm_user_track_range(start, len);
+        } else {
+            /* Decommit (allocator mprotect(PROT_NONE)): the range is no
+             * longer readable, so any chunk it just emptied of readable
+             * pages can drop its slot and recycle its guest-physical space.
+             * Without this an allocator that strides commit/decommit across a
+             * long-lived reservation pins a chunk per touched GiB and
+             * eventually exhausts the GPA pool. */
+            kvm_user_untrack_range(start, len);
+        }
     }
 #endif
     return ret;
@@ -1018,10 +1028,19 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int target_prot,
     mmap_unlock();
 
 #ifdef TARGET_X86_64
-    /* Ensure the KVM guest can reach the newly mapped range.  Skip PROT_NONE
-     * reservations (no backing; a guest access faults, which is correct). */
-    if (ret != -1 && kvm_user_enabled && (target_prot & PROT_READ)) {
-        kvm_user_track_range(ret, len);
+    if (ret != -1 && kvm_user_enabled) {
+        if (target_prot & PROT_READ) {
+            /* Ensure the KVM guest can reach the newly mapped range. */
+            kvm_user_track_range(ret, len);
+        } else {
+            /* A non-readable mapping.  For a fresh PROT_NONE reservation this
+             * is a no-op, but a MAP_FIXED PROT_NONE over a previously-readable
+             * region (the allocator "purge"/decommit idiom, dropping pages and
+             * protection in one syscall) must reclaim any chunk it just
+             * emptied of readable pages -- otherwise chunks leak exactly as a
+             * mprotect(PROT_NONE) decommit would. */
+            kvm_user_untrack_range(ret, len);
+        }
     }
 #endif
 
