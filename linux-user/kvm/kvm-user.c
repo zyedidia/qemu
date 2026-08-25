@@ -209,6 +209,36 @@ static int kvm_ioctl(int fd, int req, void *arg, const char *what)
 /* Memory: GVA<->GPA chunk translation + slot bookkeeping             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Chunk recycling deletes memslots, and by default x86 KVM reacts to a slot
+ * deletion by invalidating the ENTIRE VM's TDP mappings -- a legacy
+ * workaround for a never-diagnosed VFIO passthrough regression -- so every
+ * recycle forces all vCPUs to refault their whole working set (measured at
+ * ~40 ms per 128 MiB resident).  Kernels >= 6.12 expose that behavior as
+ * KVM_X86_QUIRK_SLOT_ZAP_ALL; disabling it makes a deletion zap only the
+ * deleted slot's GPA range.  Correctness is unaffected either way: the
+ * remote TLB flush on deletion (which GPA recycling relies on) happens in
+ * both modes.  Call once per VM, right after KVM_CREATE_VM.
+ */
+static void disable_slot_zap_quirk(void)
+{
+#ifdef KVM_X86_QUIRK_SLOT_ZAP_ALL
+    int mask = ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_DISABLE_QUIRKS2);
+    if (mask > 0 && (mask & KVM_X86_QUIRK_SLOT_ZAP_ALL)) {
+        struct kvm_enable_cap cap = {
+            .cap = KVM_CAP_DISABLE_QUIRKS2,
+            .args = { KVM_X86_QUIRK_SLOT_ZAP_ALL },
+        };
+        kvm_ioctl(vm_fd, KVM_ENABLE_CAP, &cap,
+                  "KVM_ENABLE_CAP (disable slot-zap-all quirk)");
+        DBG("slot-zap-all quirk disabled: deletes zap only the dead slot\n");
+    } else {
+        DBG("slot-zap-all quirk unsupported (pre-6.12 kernel): each chunk "
+            "recycle invalidates the whole VM's TDP mappings\n");
+    }
+#endif
+}
+
 static void add_memslot(uint32_t slot, uint64_t gpa, uint64_t hva, uint64_t size)
 {
     struct kvm_userspace_memory_region region = {
@@ -934,6 +964,7 @@ void kvm_user_fork_child(CPUState *cs)
         _exit(1);
     }
     vm_fd = kvm_ioctl(kvm_fd, KVM_CREATE_VM, (void *)0, "KVM_CREATE_VM");
+    disable_slot_zap_quirk();
 
     /*
      * The control region and the chunk allocator state are plain COW memory
@@ -972,6 +1003,7 @@ void kvm_user_setup(CPUState *cs)
     }
     vm_fd = kvm_ioctl(kvm_fd, KVM_CREATE_VM, (void *)0, "KVM_CREATE_VM");
     DBG("vm created (fd=%d)\n", vm_fd);
+    disable_slot_zap_quirk();
 
     setup_memory();
     setup_page_tables();
