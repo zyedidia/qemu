@@ -143,6 +143,12 @@ static uint64_t sc_hist[SC_HIST_N];   /* per-syscall-number exit histogram */
 
 /* XCR0 feature bits enabled at start (SIMD on): x87 | SSE | AVX. */
 #define XCR0_INIT      0x7
+/* AVX-512 state trio (opmask | ZMM_Hi256 | Hi16_ZMM), ORed in when the host
+ * supports it.  Besides making AVX-512 usable, this is a hard performance
+ * requirement on AMD Zen 4: op-cache delivery is disabled in SVM guest mode
+ * unless the guest can architecturally execute AVX-512 (CR4.OSFXSR+OSXSAVE
+ * and these XCR0 bits), costing ~2x on frontend-bound code at any CPL. */
+#define XCR0_AVX512    0xE0
 #define EFER_SCE 0x1
 #define EFER_LME 0x100
 #define EFER_LMA 0x400
@@ -1085,14 +1091,21 @@ static void setup_msrs(CPUState *cs)
     set_msr(cs, MSR_IA32_TSC, host_rdtsc());
 }
 
+/* XCR0 features KVM supports (CPUID leaf 0xD index 0), from setup_cpuid(). */
+static uint64_t supported_xcr0;
+
 static void setup_xcrs(CPUState *cs)
 {
-    /* Enable x87|SSE|AVX in XCR0 so the guest can use AVX/AVX2 (SIMD on).
+    /* Enable x87|SSE|AVX in XCR0 so the guest can use AVX/AVX2 (SIMD on),
+     * plus the AVX-512 state when available (see XCR0_AVX512 above).
      * Must follow KVM_SET_CPUID2 (KVM validates XCR0 against CPUID leaf 0xD). */
     struct kvm_xcrs xcrs = { 0 };
     xcrs.nr_xcrs = 1;
     xcrs.xcrs[0].xcr = 0;
     xcrs.xcrs[0].value = XCR0_INIT;
+    if ((supported_xcr0 & XCR0_AVX512) == XCR0_AVX512) {
+        xcrs.xcrs[0].value |= XCR0_AVX512;
+    }
     kvm_ioctl(cs->kvm_fd, KVM_SET_XCRS, &xcrs, "KVM_SET_XCRS");
 }
 
@@ -1104,6 +1117,13 @@ static void setup_cpuid(CPUState *cs)
     cpuid->nent = nent;
     kvm_ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, cpuid, "KVM_GET_SUPPORTED_CPUID");
     kvm_ioctl(cs->kvm_fd, KVM_SET_CPUID2, cpuid, "KVM_SET_CPUID2");
+    for (int i = 0; i < cpuid->nent; i++) {
+        if (cpuid->entries[i].function == 0xD && cpuid->entries[i].index == 0) {
+            supported_xcr0 = cpuid->entries[i].eax |
+                             ((uint64_t)cpuid->entries[i].edx << 32);
+            break;
+        }
+    }
     g_free(cpuid);
 }
 
